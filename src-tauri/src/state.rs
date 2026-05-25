@@ -28,6 +28,11 @@ pub struct AppState {
     /// command and the periodic scheduler can otherwise fire concurrently —
     /// `try_lock` lets a second run bow out instead of duplicating the work.
     pub refresh_lock: Mutex<()>,
+    /// Held for the duration of a sync run. Manual, refresh-triggered, and
+    /// queued near-real-time syncs all share the same remote queue, so they
+    /// must not drain it concurrently. This covers the full HTTP+DB sync flow;
+    /// it is not the DB lock itself.
+    pub sync_lock: Mutex<()>,
     /// A `papr://subscribe` URL delivered before the webview registered its
     /// `deep-link-subscribe` listener — typically a cold-start launch where the
     /// link arrives during `setup()`. The frontend drains this once on mount
@@ -46,6 +51,7 @@ impl AppState {
             next_reader: AtomicUsize::new(0),
             http: RwLock::new(http),
             refresh_lock: Mutex::new(()),
+            sync_lock: Mutex::new(()),
             pending_deep_link: std::sync::Mutex::new(None),
         }
     }

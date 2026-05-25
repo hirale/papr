@@ -11,8 +11,9 @@ use std::sync::LazyLock;
 
 /// Append-only schema migrations. Never edit a shipped migration — add a new one.
 static MIGRATIONS: LazyLock<Migrations> = LazyLock::new(|| {
-    Migrations::new(vec![M::up(
-        r#"
+    Migrations::new(vec![
+        M::up(
+            r#"
         CREATE TABLE folders (
             id        INTEGER PRIMARY KEY,
             name      TEXT NOT NULL,
@@ -232,15 +233,29 @@ static MIGRATIONS: LazyLock<Migrations> = LazyLock::new(|| {
         // manual rename on the very next poll. This flag lets `update_feed_meta`
         // leave a user-named feed's title alone while still refreshing every
         // other piece of feed metadata.
-        M::up(
-            "ALTER TABLE feeds ADD COLUMN custom_title INTEGER NOT NULL DEFAULT 0;",
-        ),
+        M::up("ALTER TABLE feeds ADD COLUMN custom_title INTEGER NOT NULL DEFAULT 0;"),
         // v14 — cache a translated copy of the article body. `translated_lang`
         // records the target language the cache was produced for, so a later
         // change to the translation-target setting is detected as a cache miss.
         M::up(
             "ALTER TABLE articles ADD COLUMN translated_html TEXT;
              ALTER TABLE articles ADD COLUMN translated_lang TEXT;",
+        ),
+        // v15 — durable FreshRSS subscription mutations. The queue stores
+        // feed_url rather than feed_id so an unsubscribe survives the local feed
+        // delete it was created by. Latest action wins per URL; retry metadata
+        // lets repeated remote failures stop looping forever.
+        M::up(
+            r#"
+            CREATE TABLE freshrss_feed_sync_queue (
+                feed_url   TEXT PRIMARY KEY,
+                action     TEXT NOT NULL CHECK(action IN ('subscribe', 'unsubscribe')),
+                attempts   INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                terminal   INTEGER NOT NULL DEFAULT 0,
+                queued_at  TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            "#,
         ),
     ])
 });
@@ -388,7 +403,10 @@ pub fn rename_folder(conn: &Connection, id: i64, name: &str) -> AppResult<()> {
     if clash.is_some() {
         return Err(AppError::code("folderNameExists"));
     }
-    conn.execute("UPDATE folders SET name = ?2 WHERE id = ?1", params![id, name])?;
+    conn.execute(
+        "UPDATE folders SET name = ?2 WHERE id = ?1",
+        params![id, name],
+    )?;
     Ok(())
 }
 
@@ -401,9 +419,11 @@ pub fn delete_folder(conn: &Connection, id: i64) -> AppResult<()> {
 
 pub fn find_feed_by_url(conn: &Connection, url: &str) -> AppResult<Option<i64>> {
     Ok(conn
-        .query_row("SELECT id FROM feeds WHERE feed_url = ?1", params![url], |r| {
-            r.get(0)
-        })
+        .query_row(
+            "SELECT id FROM feeds WHERE feed_url = ?1",
+            params![url],
+            |r| r.get(0),
+        )
         .optional()?)
 }
 
@@ -419,7 +439,14 @@ pub fn insert_feed(
     conn.execute(
         "INSERT INTO feeds(feed_url, site_url, title, description, source_type, folder_id)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![feed_url, site_url, title, description, source_type.as_str(), folder_id],
+        params![
+            feed_url,
+            site_url,
+            title,
+            description,
+            source_type.as_str(),
+            folder_id
+        ],
     )?;
     Ok(conn.last_insert_rowid())
 }
@@ -578,11 +605,6 @@ pub fn set_feed_error(conn: &Connection, id: i64, error: &str) -> AppResult<()> 
     Ok(())
 }
 
-pub fn delete_feed(conn: &Connection, id: i64) -> AppResult<()> {
-    conn.execute("DELETE FROM feeds WHERE id = ?1", params![id])?;
-    Ok(())
-}
-
 /// Feeds for OPML export as `(title, feed_url, folder)` tuples. Newsletter
 /// sources are excluded: OPML is an RSS-subscription interchange format, and a
 /// newsletter's `feed_url` is a synthetic `imap://user@host:port/folder`
@@ -613,7 +635,10 @@ pub fn folder_id_by_name(conn: &Connection, name: &str) -> AppResult<i64> {
 }
 
 pub fn move_feed(conn: &Connection, id: i64, folder_id: Option<i64>) -> AppResult<()> {
-    conn.execute("UPDATE feeds SET folder_id = ?2 WHERE id = ?1", params![id, folder_id])?;
+    conn.execute(
+        "UPDATE feeds SET folder_id = ?2 WHERE id = ?1",
+        params![id, folder_id],
+    )?;
     Ok(())
 }
 
@@ -670,7 +695,14 @@ pub fn insert_newsletter_source(
     tx.execute(
         "INSERT INTO newsletter_sources(feed_id, host, port, username, password, folder)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![feed_id, cfg.host, cfg.port, cfg.username, cfg.password, cfg.folder],
+        params![
+            feed_id,
+            cfg.host,
+            cfg.port,
+            cfg.username,
+            cfg.password,
+            cfg.folder
+        ],
     )?;
     tx.commit()?;
     Ok(feed_id)
@@ -835,9 +867,18 @@ pub fn upsert_article(
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
          ON CONFLICT(feed_id, guid) DO NOTHING",
         params![
-            feed_id, a.guid, a.url, a.title, a.author, a.summary,
-            a.content_html, a.body_text, a.image_url, a.published_at,
-            start_read, start_starred
+            feed_id,
+            a.guid,
+            a.url,
+            a.title,
+            a.author,
+            a.summary,
+            a.content_html,
+            a.body_text,
+            a.image_url,
+            a.published_at,
+            start_read,
+            start_starred
         ],
     )?;
     if n == 0 {
@@ -888,9 +929,8 @@ pub fn list_articles(
             binds.push(Value::Integer(*id));
         }
         ArticleQuery::Tag(id) => {
-            where_clauses.push(
-                "a.id IN (SELECT article_id FROM article_tags WHERE tag_id = ?)".into(),
-            );
+            where_clauses
+                .push("a.id IN (SELECT article_id FROM article_tags WHERE tag_id = ?)".into());
             binds.push(Value::Integer(*id));
         }
     }
@@ -966,9 +1006,7 @@ pub fn card_image_backfill_scan(conn: &Connection) -> AppResult<Vec<(i64, String
         "SELECT id, content_html FROM articles
          WHERE image_url IS NULL AND content_html IS NOT NULL AND content_html <> ''",
     )?;
-    let rows = stmt.query_map([], |r| {
-        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
-    })?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
     let mut out = Vec::new();
     for row in rows {
         let (id, html) = row?;
@@ -1125,17 +1163,26 @@ pub fn article_text(conn: &Connection, id: i64) -> AppResult<(String, String)> {
 }
 
 pub fn set_read(conn: &Connection, id: i64, read: bool) -> AppResult<()> {
-    conn.execute("UPDATE articles SET is_read = ?2 WHERE id = ?1", params![id, read])?;
+    conn.execute(
+        "UPDATE articles SET is_read = ?2 WHERE id = ?1",
+        params![id, read],
+    )?;
     Ok(())
 }
 
 pub fn set_starred(conn: &Connection, id: i64, starred: bool) -> AppResult<()> {
-    conn.execute("UPDATE articles SET is_starred = ?2 WHERE id = ?1", params![id, starred])?;
+    conn.execute(
+        "UPDATE articles SET is_starred = ?2 WHERE id = ?1",
+        params![id, starred],
+    )?;
     Ok(())
 }
 
 pub fn set_read_later(conn: &Connection, id: i64, v: bool) -> AppResult<()> {
-    conn.execute("UPDATE articles SET read_later = ?2 WHERE id = ?1", params![id, v])?;
+    conn.execute(
+        "UPDATE articles SET read_later = ?2 WHERE id = ?1",
+        params![id, v],
+    )?;
     Ok(())
 }
 
@@ -1157,7 +1204,10 @@ pub fn set_extracted_html(conn: &Connection, id: i64, html: &str) -> AppResult<(
 }
 
 pub fn set_ai_summary(conn: &Connection, id: i64, summary: &str) -> AppResult<()> {
-    conn.execute("UPDATE articles SET ai_summary = ?2 WHERE id = ?1", params![id, summary])?;
+    conn.execute(
+        "UPDATE articles SET ai_summary = ?2 WHERE id = ?1",
+        params![id, summary],
+    )?;
     Ok(())
 }
 
@@ -1196,8 +1246,7 @@ pub fn mark_all_read(
             Some(*id),
         ),
     };
-    let bind: Vec<&dyn rusqlite::ToSql> =
-        id.iter().map(|v| v as &dyn rusqlite::ToSql).collect();
+    let bind: Vec<&dyn rusqlite::ToSql> = id.iter().map(|v| v as &dyn rusqlite::ToSql).collect();
 
     // Queue + flip together: the sync-queue rows and the is_read change must
     // commit atomically, or a mid-way failure leaves the queue claiming a
@@ -1234,11 +1283,14 @@ pub fn mark_all_read(
 
 /// Whether a FreshRSS server is currently linked (a non-empty URL is stored).
 pub fn is_freshrss_connected(conn: &Connection) -> bool {
-    get_setting(conn, "freshrss_url")
-        .ok()
-        .flatten()
-        .map(|u| !u.trim().is_empty())
-        .unwrap_or(false)
+    match get_setting(conn, "freshrss_url") {
+        Ok(Some(url)) => !url.trim().is_empty(),
+        Ok(None) => false,
+        Err(e) => {
+            log::warn!("sync: reading freshrss_url failed: {e}");
+            false
+        }
+    }
 }
 
 // ─────────────────────────── tags ───────────────────────────
@@ -1345,7 +1397,10 @@ pub fn rename_tag(conn: &Connection, id: i64, name: &str) -> AppResult<()> {
 }
 
 pub fn set_tag_color(conn: &Connection, id: i64, color: &str) -> AppResult<()> {
-    conn.execute("UPDATE tags SET color = ?2 WHERE id = ?1", params![id, color])?;
+    conn.execute(
+        "UPDATE tags SET color = ?2 WHERE id = ?1",
+        params![id, color],
+    )?;
     Ok(())
 }
 
@@ -1426,8 +1481,9 @@ const RULE_COLS: &str = "id, name, enabled, feed_id, field, query, action, posit
 
 /// Every rule, enabled or not, ordered for the settings list.
 pub fn list_rules(conn: &Connection) -> AppResult<Vec<Rule>> {
-    let mut stmt =
-        conn.prepare(&format!("SELECT {RULE_COLS} FROM rules ORDER BY position, id"))?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {RULE_COLS} FROM rules ORDER BY position, id"
+    ))?;
     let rows = stmt
         .query_map([], row_to_rule)?
         .collect::<Result<Vec<_>, _>>()?;
@@ -1540,7 +1596,9 @@ fn rule_match_where(
             .replace('%', "\\%")
             .replace('_', "\\_");
         for col in cols {
-            ors.push(format!("unicode_lower(COALESCE({col},'')) LIKE ? ESCAPE '\\'"));
+            ors.push(format!(
+                "unicode_lower(COALESCE({col},'')) LIKE ? ESCAPE '\\'"
+            ));
             binds.push(Value::Text(format!("%{escaped}%")));
         }
     }
@@ -1739,9 +1797,11 @@ pub fn delete_highlight(conn: &Connection, id: i64) -> AppResult<()> {
 
 pub fn get_setting(conn: &Connection, key: &str) -> AppResult<Option<String>> {
     Ok(conn
-        .query_row("SELECT value FROM settings WHERE key = ?1", params![key], |r| {
-            r.get(0)
-        })
+        .query_row(
+            "SELECT value FROM settings WHERE key = ?1",
+            params![key],
+            |r| r.get(0),
+        )
         .optional()?)
 }
 
@@ -1853,7 +1913,11 @@ pub fn reset_settings(conn: &Connection) -> AppResult<()> {
 }
 
 pub fn count_unread(conn: &Connection) -> AppResult<i64> {
-    Ok(conn.query_row("SELECT COUNT(*) FROM articles WHERE is_read = 0", [], |r| r.get(0))?)
+    Ok(
+        conn.query_row("SELECT COUNT(*) FROM articles WHERE is_read = 0", [], |r| {
+            r.get(0)
+        })?,
+    )
 }
 
 /// Unread article count for a single feed — the same expression `list_feeds`
@@ -1870,12 +1934,18 @@ pub fn count_feed_unread(conn: &Connection, feed_id: i64) -> AppResult<i64> {
 
 /// Timestamp of the most recent successful feed fetch, if any.
 pub fn latest_fetch(conn: &Connection) -> AppResult<Option<String>> {
-    Ok(conn.query_row("SELECT MAX(last_fetched_at) FROM feeds", [], |r| {
-        r.get::<_, Option<String>>(0)
-    })?)
+    Ok(
+        conn.query_row("SELECT MAX(last_fetched_at) FROM feeds", [], |r| {
+            r.get::<_, Option<String>>(0)
+        })?,
+    )
 }
 
 // ─────────────────────────── sync ───────────────────────────
+
+pub const FRESHRSS_FEED_ACTION_SUBSCRIBE: &str = "subscribe";
+pub const FRESHRSS_FEED_ACTION_UNSUBSCRIBE: &str = "unsubscribe";
+pub const FRESHRSS_FEED_SYNC_MAX_ATTEMPTS: i64 = 5;
 
 /// Local article id for a given source URL — used to reconcile remote state.
 pub fn article_id_by_url(conn: &Connection, url: &str) -> AppResult<Option<i64>> {
@@ -1888,35 +1958,57 @@ pub fn article_id_by_url(conn: &Connection, url: &str) -> AppResult<Option<i64>>
         .optional()?)
 }
 
+pub fn article_id_by_feed_guid(
+    conn: &Connection,
+    feed_id: i64,
+    guid: &str,
+) -> AppResult<Option<i64>> {
+    Ok(conn
+        .query_row(
+            "SELECT id FROM articles WHERE feed_id = ?1 AND guid = ?2 LIMIT 1",
+            params![feed_id, guid],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
 pub fn set_remote_id(conn: &Connection, article_id: i64, remote_id: &str) -> AppResult<()> {
     conn.execute(
-        "UPDATE articles SET remote_id = ?2 WHERE id = ?1",
+        "UPDATE articles
+         SET remote_id = ?2
+         WHERE id = ?1 AND (remote_id IS NULL OR remote_id <> ?2)",
         params![article_id, remote_id],
     )?;
     Ok(())
 }
 
-/// Apply remote read/starred state to a local article.
+pub fn article_sync_state(conn: &Connection, article_id: i64) -> AppResult<(bool, bool)> {
+    Ok(conn.query_row(
+        "SELECT is_read, is_starred FROM articles WHERE id = ?1",
+        params![article_id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?)
+}
+
+/// Apply remote read/starred state to a local article. Returns true only when
+/// the stored state actually changed.
 pub fn set_sync_state(
     conn: &Connection,
     article_id: i64,
     read: bool,
     starred: bool,
-) -> AppResult<()> {
-    conn.execute(
-        "UPDATE articles SET is_read = ?2, is_starred = ?3 WHERE id = ?1",
+) -> AppResult<bool> {
+    let changed = conn.execute(
+        "UPDATE articles
+         SET is_read = ?2, is_starred = ?3
+         WHERE id = ?1 AND (is_read <> ?2 OR is_starred <> ?3)",
         params![article_id, read, starred],
     )?;
-    Ok(())
+    Ok(changed > 0)
 }
 
 /// Queue a local read/starred change to push on the next sync.
-pub fn enqueue_sync(
-    conn: &Connection,
-    article_id: i64,
-    field: &str,
-    value: bool,
-) -> AppResult<()> {
+pub fn enqueue_sync(conn: &Connection, article_id: i64, field: &str, value: bool) -> AppResult<()> {
     conn.execute(
         "INSERT INTO sync_queue(article_id, field, value) VALUES (?1, ?2, ?3)
          ON CONFLICT(article_id, field) DO UPDATE SET value = excluded.value",
@@ -1981,6 +2073,196 @@ pub fn requeue_sync(conn: &Connection, article_id: i64, field: &str, value: bool
         params![article_id, field, value],
     )?;
     Ok(())
+}
+
+/// Whether FreshRSS subscription mutations should be queued. Existing Miniflux
+/// installs still use the read/starred GReader path, but feed add/delete push is
+/// FreshRSS-only.
+pub fn is_freshrss_subscription_sync_enabled(conn: &Connection) -> bool {
+    let connected = match get_setting(conn, "freshrss_url") {
+        Ok(Some(url)) => !url.trim().is_empty(),
+        Ok(None) => false,
+        Err(e) => {
+            log::warn!("sync: reading freshrss_url failed: {e}");
+            false
+        }
+    };
+    if !connected {
+        return false;
+    }
+    match get_setting(conn, "freshrss_provider") {
+        Ok(provider) => !matches!(provider.as_deref(), Some("miniflux")),
+        Err(e) => {
+            log::warn!("sync: reading freshrss_provider failed: {e}");
+            false
+        }
+    }
+}
+
+fn enqueue_freshrss_feed_sync(conn: &Connection, feed_url: &str, action: &str) -> AppResult<()> {
+    if !matches!(
+        action,
+        FRESHRSS_FEED_ACTION_SUBSCRIBE | FRESHRSS_FEED_ACTION_UNSUBSCRIBE
+    ) {
+        return Err(AppError::other(format!(
+            "invalid FreshRSS feed sync action: {action}"
+        )));
+    }
+    conn.execute(
+        "INSERT INTO freshrss_feed_sync_queue(feed_url, action, attempts, last_error, terminal)
+         VALUES (?1, ?2, 0, NULL, 0)
+         ON CONFLICT(feed_url) DO UPDATE SET
+             action = excluded.action,
+             attempts = CASE
+                 WHEN freshrss_feed_sync_queue.action != excluded.action
+                      OR freshrss_feed_sync_queue.terminal != 0 THEN 0
+                 ELSE freshrss_feed_sync_queue.attempts
+             END,
+             terminal = CASE
+                 WHEN freshrss_feed_sync_queue.action != excluded.action
+                      OR freshrss_feed_sync_queue.terminal != 0 THEN 0
+                 ELSE freshrss_feed_sync_queue.terminal
+             END,
+             last_error = CASE
+                 WHEN freshrss_feed_sync_queue.action != excluded.action
+                      OR freshrss_feed_sync_queue.terminal != 0 THEN NULL
+                 ELSE freshrss_feed_sync_queue.last_error
+             END,
+             queued_at = CASE
+                 WHEN freshrss_feed_sync_queue.action != excluded.action
+                      OR freshrss_feed_sync_queue.terminal != 0 THEN datetime('now')
+                 ELSE freshrss_feed_sync_queue.queued_at
+             END",
+        params![feed_url, action],
+    )?;
+    Ok(())
+}
+
+pub fn enqueue_freshrss_subscribe_if_connected(
+    conn: &Connection,
+    feed_url: &str,
+) -> AppResult<bool> {
+    if !is_freshrss_subscription_sync_enabled(conn) {
+        return Ok(false);
+    }
+    enqueue_freshrss_feed_sync(conn, feed_url, FRESHRSS_FEED_ACTION_SUBSCRIBE)?;
+    Ok(true)
+}
+
+pub fn enqueue_freshrss_unsubscribe_if_connected(
+    conn: &Connection,
+    feed_url: &str,
+) -> AppResult<bool> {
+    if !is_freshrss_subscription_sync_enabled(conn) {
+        return Ok(false);
+    }
+    enqueue_freshrss_feed_sync(conn, feed_url, FRESHRSS_FEED_ACTION_UNSUBSCRIBE)?;
+    Ok(true)
+}
+
+pub fn delete_feed_with_freshrss_sync(conn: &Connection, id: i64) -> AppResult<bool> {
+    let tx = conn.unchecked_transaction()?;
+    let feed = tx
+        .query_row(
+            "SELECT feed_url, source_type FROM feeds WHERE id = ?1",
+            params![id],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    let mut queued = false;
+    if let Some((feed_url, source_type)) = feed {
+        if source_type != "newsletter" {
+            queued = enqueue_freshrss_unsubscribe_if_connected(&tx, &feed_url)?;
+        }
+    }
+    tx.execute("DELETE FROM feeds WHERE id = ?1", params![id])?;
+    tx.commit()?;
+    Ok(queued)
+}
+
+pub struct FreshrssFeedSyncEntry {
+    pub feed_url: String,
+    pub action: String,
+}
+
+pub fn freshrss_feed_sync_entries(
+    conn: &Connection,
+    limit: usize,
+) -> AppResult<Vec<FreshrssFeedSyncEntry>> {
+    let mut stmt = conn.prepare(
+        "SELECT feed_url, action
+         FROM freshrss_feed_sync_queue
+         WHERE terminal = 0
+         ORDER BY attempts, queued_at, feed_url
+         LIMIT ?1",
+    )?;
+    let rows = stmt
+        .query_map([limit as i64], |r| {
+            Ok(FreshrssFeedSyncEntry {
+                feed_url: r.get(0)?,
+                action: r.get(1)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+pub fn clear_freshrss_feed_sync_entry(
+    conn: &Connection,
+    feed_url: &str,
+    action: &str,
+) -> AppResult<()> {
+    conn.execute(
+        "DELETE FROM freshrss_feed_sync_queue WHERE feed_url = ?1 AND action = ?2",
+        params![feed_url, action],
+    )?;
+    Ok(())
+}
+
+pub fn clear_freshrss_feed_sync_queue(conn: &Connection) -> AppResult<()> {
+    conn.execute("DELETE FROM freshrss_feed_sync_queue", [])?;
+    Ok(())
+}
+
+pub fn mark_freshrss_feed_sync_failure(
+    conn: &Connection,
+    feed_url: &str,
+    action: &str,
+    error: &str,
+) -> AppResult<bool> {
+    let changed = conn.execute(
+        "UPDATE freshrss_feed_sync_queue
+         SET attempts = attempts + 1,
+             last_error = ?3,
+             terminal = CASE
+                 WHEN attempts + 1 >= ?4 THEN 1
+                 ELSE terminal
+             END
+         WHERE feed_url = ?1 AND action = ?2",
+        params![feed_url, action, error, FRESHRSS_FEED_SYNC_MAX_ATTEMPTS],
+    )?;
+    Ok(changed > 0)
+}
+
+pub fn has_freshrss_feed_sync_work(conn: &Connection) -> AppResult<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM freshrss_feed_sync_queue WHERE terminal = 0
+         )",
+        [],
+        |r| r.get::<_, bool>(0),
+    )?)
+}
+
+pub fn pending_freshrss_unsubscribe_urls(conn: &Connection) -> AppResult<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT feed_url FROM freshrss_feed_sync_queue
+         WHERE action = 'unsubscribe' AND terminal = 0",
+    )?;
+    let rows = stmt
+        .query_map([], |r| r.get(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
 }
 
 #[cfg(test)]
@@ -2094,9 +2376,11 @@ mod tests {
             .query_row("SELECT id FROM feeds", [], |r| r.get(0))
             .unwrap();
         let kind = |c: &Connection| -> String {
-            c.query_row("SELECT source_type FROM feeds WHERE id = ?1", params![feed_id], |r| {
-                r.get(0)
-            })
+            c.query_row(
+                "SELECT source_type FROM feeds WHERE id = ?1",
+                params![feed_id],
+                |r| r.get(0),
+            )
             .unwrap()
         };
         // The test feed starts generic.
@@ -2143,7 +2427,9 @@ mod tests {
         assert_eq!(exported.len(), 1);
         assert_eq!(exported[0].1, "https://example.com/feed.xml");
         assert!(
-            !exported.iter().any(|(_, url, _)| url.starts_with("imap://")),
+            !exported
+                .iter()
+                .any(|(_, url, _)| url.starts_with("imap://")),
             "no synthetic imap:// url should reach the OPML"
         );
     }
@@ -2151,8 +2437,11 @@ mod tests {
     #[test]
     fn insert_and_list_highlight() {
         let (conn, aid) = test_db();
-        let id = insert_highlight(&conn, &hl(aid, "quoted text", "pre", "suf", 12, "yellow", ""))
-            .unwrap();
+        let id = insert_highlight(
+            &conn,
+            &hl(aid, "quoted text", "pre", "suf", 12, "yellow", ""),
+        )
+        .unwrap();
         let all = list_highlights(&conn, aid).unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].id, id);
@@ -2277,8 +2566,20 @@ mod tests {
         let feed_id: i64 = conn
             .query_row("SELECT id FROM feeds", [], |r| r.get(0))
             .unwrap();
-        add_article(&conn, feed_id, "rust", "Rust news", "the borrow checker explained");
-        add_article(&conn, feed_id, "privacy", "Privacy law", "a new data privacy regulation");
+        add_article(
+            &conn,
+            feed_id,
+            "rust",
+            "Rust news",
+            "the borrow checker explained",
+        );
+        add_article(
+            &conn,
+            feed_id,
+            "privacy",
+            "Privacy law",
+            "a new data privacy regulation",
+        );
 
         // A natural-language question shares only *some* words with each
         // article. An AND join would require every word to appear and return
@@ -2299,7 +2600,9 @@ mod tests {
         let (conn, _aid) = test_db();
         // An all-stopword / punctuation-only question must not error and must
         // return nothing (the match-nothing `""` expression).
-        assert!(search_articles_for_rag(&conn, "??? !!!", 6).unwrap().is_empty());
+        assert!(search_articles_for_rag(&conn, "??? !!!", 6)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -2364,9 +2667,7 @@ mod tests {
             "a tag created after a middle delete must sort last, got {order:?}",
         );
         // The pre-existing tags keep their relative order.
-        assert!(
-            order.iter().position(|&x| x == a) < order.iter().position(|&x| x == zoo),
-        );
+        assert!(order.iter().position(|&x| x == a) < order.iter().position(|&x| x == zoo),);
     }
 
     #[test]
@@ -2491,14 +2792,13 @@ mod tests {
         };
 
         // Pre-marked read by the rule → not new.
-        assert!(!upsert_article(&conn, feed_id, &mk("g-ad", "Sponsored Item"), false, &rules)
-            .unwrap());
+        assert!(
+            !upsert_article(&conn, feed_id, &mk("g-ad", "Sponsored Item"), false, &rules).unwrap()
+        );
         // A plain article → genuinely new.
-        assert!(upsert_article(&conn, feed_id, &mk("g-ok", "Real Story"), false, &rules)
-            .unwrap());
+        assert!(upsert_article(&conn, feed_id, &mk("g-ok", "Real Story"), false, &rules).unwrap());
         // A duplicate guid → not new (no double count).
-        assert!(!upsert_article(&conn, feed_id, &mk("g-ok", "Real Story"), false, &rules)
-            .unwrap());
+        assert!(!upsert_article(&conn, feed_id, &mk("g-ok", "Real Story"), false, &rules).unwrap());
     }
 
     // ── rule matching ────────────────────────────────────────────────
@@ -2588,9 +2888,11 @@ mod tests {
 
         // Lower-case non-ASCII keywords must still count the article.
         for keyword in ["café", "zürich"] {
-            let (count, samples) =
-                preview_rule(&conn, None, "title", keyword).unwrap();
-            assert_eq!(count, 1, "keyword `{keyword}` should match the CAFÉ article");
+            let (count, samples) = preview_rule(&conn, None, "title", keyword).unwrap();
+            assert_eq!(
+                count, 1,
+                "keyword `{keyword}` should match the CAFÉ article"
+            );
             assert_eq!(samples.len(), 1);
         }
 
@@ -2651,9 +2953,11 @@ mod tests {
         let n = apply_rule_to_existing(&conn, None, "title", "java", "star").unwrap();
         assert_eq!(n, 2, "both Java/JavaScript titles get starred");
         let starred: i64 = conn
-            .query_row("SELECT COUNT(*) FROM articles WHERE is_starred = 1", [], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT COUNT(*) FROM articles WHERE is_starred = 1",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(starred, 2);
 
@@ -2697,7 +3001,10 @@ mod tests {
         let fts: i64 = conn
             .query_row("SELECT COUNT(*) FROM articles_fts", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(arts, fts, "FTS index stays in sync after a skip-rule delete");
+        assert_eq!(
+            arts, fts,
+            "FTS index stays in sync after a skip-rule delete"
+        );
     }
 
     #[test]
@@ -2729,7 +3036,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(starred_in_a, 0, "a feed-scoped rule must not touch other feeds");
+        assert_eq!(
+            starred_in_a, 0,
+            "a feed-scoped rule must not touch other feeds"
+        );
     }
 
     // ── mark_all_read sync queueing ──────────────────────────────────
@@ -2773,6 +3083,329 @@ mod tests {
         assert_eq!(queued, 0);
     }
 
+    #[test]
+    fn queued_read_without_remote_id_becomes_pushable_after_remote_id_assigned() {
+        // A just-fetched local article may be marked read before the next sync
+        // has matched it to FreshRSS. The queue row must stay durable until
+        // reconciliation writes `remote_id`, then become pushable immediately.
+        let (conn, aid) = test_db();
+        enqueue_sync(&conn, aid, "read", true).unwrap();
+
+        assert!(
+            take_sync_queue(&conn).unwrap().is_empty(),
+            "rows without a remote id are not pushable yet"
+        );
+        let queued: i64 = conn
+            .query_row("SELECT count(*) FROM sync_queue", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(queued, 1, "the unpushable row must remain queued");
+
+        set_remote_id(&conn, aid, "remote-1").unwrap();
+        let entries = take_sync_queue(&conn).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].article_id, aid);
+        assert_eq!(entries[0].remote_id, "remote-1");
+        assert_eq!(entries[0].field, "read");
+        assert!(entries[0].value);
+
+        let queued: i64 = conn
+            .query_row("SELECT count(*) FROM sync_queue", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(queued, 0, "pushable rows are drained after selection");
+    }
+
+    #[test]
+    fn set_remote_id_skips_noop_writes() {
+        let (conn, aid) = test_db();
+
+        set_remote_id(&conn, aid, "remote-1").unwrap();
+        assert_eq!(conn.changes(), 1);
+
+        set_remote_id(&conn, aid, "remote-1").unwrap();
+        assert_eq!(conn.changes(), 0);
+
+        set_remote_id(&conn, aid, "remote-2").unwrap();
+        assert_eq!(conn.changes(), 1);
+    }
+
+    fn enable_freshrss_subscription_sync(conn: &Connection) {
+        set_setting(conn, "freshrss_url", "https://rss.example.com").unwrap();
+        set_setting(conn, "freshrss_provider", "freshrss").unwrap();
+    }
+
+    fn freshrss_queue_row(conn: &Connection, feed_url: &str) -> (String, i64, i64, Option<String>) {
+        conn.query_row(
+            "SELECT action, attempts, terminal, last_error
+             FROM freshrss_feed_sync_queue WHERE feed_url = ?1",
+            [feed_url],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap()
+    }
+
+    fn freshrss_queue_queued_at(conn: &Connection, feed_url: &str) -> String {
+        conn.query_row(
+            "SELECT queued_at FROM freshrss_feed_sync_queue WHERE feed_url = ?1",
+            [feed_url],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn freshrss_feed_queue_coalesces_to_last_action_and_resets_on_change() {
+        let (conn, _) = test_db();
+        enable_freshrss_subscription_sync(&conn);
+        let url = "https://example.com/feed.xml";
+
+        assert!(enqueue_freshrss_subscribe_if_connected(&conn, url).unwrap());
+        mark_freshrss_feed_sync_failure(&conn, url, FRESHRSS_FEED_ACTION_SUBSCRIBE, "temporary")
+            .unwrap();
+        assert_eq!(
+            freshrss_queue_row(&conn, url).0,
+            FRESHRSS_FEED_ACTION_SUBSCRIBE
+        );
+        assert_eq!(freshrss_queue_row(&conn, url).1, 1);
+
+        assert!(enqueue_freshrss_unsubscribe_if_connected(&conn, url).unwrap());
+        let row = freshrss_queue_row(&conn, url);
+        assert_eq!(row.0, FRESHRSS_FEED_ACTION_UNSUBSCRIBE);
+        assert_eq!(row.1, 0, "action changes reset attempts");
+        assert_eq!(row.2, 0, "action changes clear terminal state");
+        assert_eq!(row.3, None, "action changes clear the last error");
+
+        assert!(enqueue_freshrss_subscribe_if_connected(&conn, url).unwrap());
+        let row = freshrss_queue_row(&conn, url);
+        assert_eq!(row.0, FRESHRSS_FEED_ACTION_SUBSCRIBE);
+        assert_eq!(row.1, 0);
+    }
+
+    #[test]
+    fn freshrss_feed_queue_same_action_reenqueue_preserves_priority() {
+        let (conn, _) = test_db();
+        enable_freshrss_subscription_sync(&conn);
+        let url = "https://example.com/feed.xml";
+
+        enqueue_freshrss_subscribe_if_connected(&conn, url).unwrap();
+        conn.execute(
+            "UPDATE freshrss_feed_sync_queue SET queued_at = '2000-01-01 00:00:00' WHERE feed_url = ?1",
+            [url],
+        )
+        .unwrap();
+
+        enqueue_freshrss_subscribe_if_connected(&conn, url).unwrap();
+
+        assert_eq!(freshrss_queue_queued_at(&conn, url), "2000-01-01 00:00:00");
+    }
+
+    #[test]
+    fn clearing_freshrss_feed_queue_respects_the_drained_action() {
+        let (conn, _) = test_db();
+        enable_freshrss_subscription_sync(&conn);
+        let url = "https://example.com/feed.xml";
+
+        enqueue_freshrss_subscribe_if_connected(&conn, url).unwrap();
+        let drained = freshrss_feed_sync_entries(&conn, 50).unwrap();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].action, FRESHRSS_FEED_ACTION_SUBSCRIBE);
+
+        enqueue_freshrss_unsubscribe_if_connected(&conn, url).unwrap();
+        clear_freshrss_feed_sync_entry(&conn, url, &drained[0].action).unwrap();
+
+        let row = freshrss_queue_row(&conn, url);
+        assert_eq!(
+            row.0, FRESHRSS_FEED_ACTION_UNSUBSCRIBE,
+            "a stale successful subscribe push must not delete a newer unsubscribe intent"
+        );
+    }
+
+    #[test]
+    fn marking_freshrss_feed_queue_failure_respects_the_drained_action() {
+        let (conn, _) = test_db();
+        enable_freshrss_subscription_sync(&conn);
+        let url = "https://example.com/feed.xml";
+
+        enqueue_freshrss_subscribe_if_connected(&conn, url).unwrap();
+        let drained = freshrss_feed_sync_entries(&conn, 50).unwrap();
+        assert_eq!(drained[0].action, FRESHRSS_FEED_ACTION_SUBSCRIBE);
+
+        enqueue_freshrss_unsubscribe_if_connected(&conn, url).unwrap();
+        assert!(!mark_freshrss_feed_sync_failure(
+            &conn,
+            url,
+            &drained[0].action,
+            "temporary failure"
+        )
+        .unwrap());
+
+        let row = freshrss_queue_row(&conn, url);
+        assert_eq!(row.0, FRESHRSS_FEED_ACTION_UNSUBSCRIBE);
+        assert_eq!(row.1, 0, "stale failures do not consume retry attempts");
+        assert_eq!(row.3, None, "stale failures do not overwrite last_error");
+    }
+
+    #[test]
+    fn clear_freshrss_feed_sync_queue_removes_pending_rows_on_disconnect() {
+        let (conn, _) = test_db();
+        enable_freshrss_subscription_sync(&conn);
+        enqueue_freshrss_subscribe_if_connected(&conn, "https://example.com/a.xml").unwrap();
+        enqueue_freshrss_unsubscribe_if_connected(&conn, "https://example.com/b.xml").unwrap();
+
+        clear_freshrss_feed_sync_queue(&conn).unwrap();
+
+        assert!(
+            !has_freshrss_feed_sync_work(&conn).unwrap(),
+            "disconnect should leave no pending FreshRSS feed mutations"
+        );
+    }
+
+    #[test]
+    fn freshrss_feed_queue_terminal_rows_stop_automatic_retry() {
+        let (conn, _) = test_db();
+        enable_freshrss_subscription_sync(&conn);
+        let url = "https://example.com/feed.xml";
+        enqueue_freshrss_subscribe_if_connected(&conn, url).unwrap();
+
+        for _ in 0..FRESHRSS_FEED_SYNC_MAX_ATTEMPTS {
+            mark_freshrss_feed_sync_failure(
+                &conn,
+                url,
+                FRESHRSS_FEED_ACTION_SUBSCRIBE,
+                "still failing",
+            )
+            .unwrap();
+        }
+
+        let row = freshrss_queue_row(&conn, url);
+        assert_eq!(row.1, FRESHRSS_FEED_SYNC_MAX_ATTEMPTS);
+        assert_eq!(row.2, 1);
+        assert!(
+            freshrss_feed_sync_entries(&conn, 50).unwrap().is_empty(),
+            "terminal rows are no longer returned for automatic push"
+        );
+    }
+
+    #[test]
+    fn freshrss_feed_queue_same_action_reenqueue_resets_terminal_failure() {
+        let (conn, _) = test_db();
+        enable_freshrss_subscription_sync(&conn);
+        let url = "https://example.com/feed.xml";
+        enqueue_freshrss_subscribe_if_connected(&conn, url).unwrap();
+
+        for _ in 0..FRESHRSS_FEED_SYNC_MAX_ATTEMPTS {
+            mark_freshrss_feed_sync_failure(
+                &conn,
+                url,
+                FRESHRSS_FEED_ACTION_SUBSCRIBE,
+                "still failing",
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "UPDATE freshrss_feed_sync_queue SET queued_at = '2000-01-01 00:00:00' WHERE feed_url = ?1",
+            [url],
+        )
+        .unwrap();
+
+        enqueue_freshrss_subscribe_if_connected(&conn, url).unwrap();
+
+        let row = freshrss_queue_row(&conn, url);
+        assert_eq!(row.1, 0);
+        assert_eq!(row.2, 0);
+        assert_eq!(row.3, None);
+        assert_ne!(freshrss_queue_queued_at(&conn, url), "2000-01-01 00:00:00");
+        assert_eq!(freshrss_feed_sync_entries(&conn, 50).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn delete_feed_queues_freshrss_unsubscribe_before_deleting_local_row() {
+        let (conn, _) = test_db();
+        enable_freshrss_subscription_sync(&conn);
+        let feed_id: i64 = conn
+            .query_row("SELECT id FROM feeds", [], |r| r.get(0))
+            .unwrap();
+        let feed_url = "https://example.com/feed.xml";
+
+        assert!(delete_feed_with_freshrss_sync(&conn, feed_id).unwrap());
+
+        let feeds: i64 = conn
+            .query_row("SELECT COUNT(*) FROM feeds WHERE id = ?1", [feed_id], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(feeds, 0);
+        assert_eq!(
+            freshrss_queue_row(&conn, feed_url).0,
+            FRESHRSS_FEED_ACTION_UNSUBSCRIBE,
+            "the pending remote unsubscribe survives local feed deletion"
+        );
+    }
+
+    #[test]
+    fn pending_freshrss_unsubscribe_blocks_pull_reinsert_until_terminal() {
+        let (conn, _) = test_db();
+        enable_freshrss_subscription_sync(&conn);
+        let url = "https://example.com/feed.xml";
+        enqueue_freshrss_unsubscribe_if_connected(&conn, url).unwrap();
+
+        assert_eq!(pending_freshrss_unsubscribe_urls(&conn).unwrap(), vec![url]);
+
+        for _ in 0..FRESHRSS_FEED_SYNC_MAX_ATTEMPTS {
+            mark_freshrss_feed_sync_failure(
+                &conn,
+                url,
+                FRESHRSS_FEED_ACTION_UNSUBSCRIBE,
+                "still failing",
+            )
+            .unwrap();
+        }
+
+        assert!(
+            pending_freshrss_unsubscribe_urls(&conn).unwrap().is_empty(),
+            "terminal unsubscribe rows are not considered pending by the pull guard"
+        );
+    }
+
+    #[test]
+    fn freshrss_feed_queue_rolls_back_with_import_transaction() {
+        let (conn, _) = test_db();
+        enable_freshrss_subscription_sync(&conn);
+        let url = "https://example.com/imported.xml";
+
+        {
+            let tx = conn.unchecked_transaction().unwrap();
+            insert_feed(&tx, url, None, "Imported", None, SourceType::Rss, None).unwrap();
+            enqueue_freshrss_subscribe_if_connected(&tx, url).unwrap();
+            assert_eq!(
+                tx.query_row(
+                    "SELECT COUNT(*) FROM freshrss_feed_sync_queue WHERE feed_url = ?1",
+                    [url],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap(),
+                1
+            );
+            tx.rollback().unwrap();
+        }
+
+        let feeds: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM feeds WHERE feed_url = ?1",
+                [url],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let queued: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM freshrss_feed_sync_queue WHERE feed_url = ?1",
+                [url],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(feeds, 0);
+        assert_eq!(queued, 0);
+    }
+
     // ── retention cleanup ────────────────────────────────────────────
 
     /// Insert a read article with an explicit RFC 3339 `published_at`, the
@@ -2813,9 +3446,11 @@ mod tests {
         // outside a 30-day window, yet a string compare wrongly keeps it.
         let (conn, fixture) = test_db();
         let feed_id: i64 = conn
-            .query_row("SELECT feed_id FROM articles WHERE id = ?1", [fixture], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT feed_id FROM articles WHERE id = ?1",
+                [fixture],
+                |r| r.get(0),
+            )
             .unwrap();
 
         // The cutoff is "now" minus 30 days, kept at the current wall-clock
@@ -2855,10 +3490,16 @@ mod tests {
         let old = (chrono::Utc::now() - chrono::Duration::days(90)).to_rfc3339();
         insert_read_article_published(&conn, feed_id, "starred", &old);
         insert_read_article_published(&conn, feed_id, "later", &old);
-        conn.execute("UPDATE articles SET is_starred = 1 WHERE guid = 'starred'", [])
-            .unwrap();
-        conn.execute("UPDATE articles SET read_later = 1 WHERE guid = 'later'", [])
-            .unwrap();
+        conn.execute(
+            "UPDATE articles SET is_starred = 1 WHERE guid = 'starred'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE articles SET read_later = 1 WHERE guid = 'later'",
+            [],
+        )
+        .unwrap();
 
         cleanup_old_articles(&conn, 30).unwrap();
         let kept: i64 = conn
@@ -2886,9 +3527,11 @@ mod tests {
         insert_read_article_published(&conn, feed_id, "plain", &old);
 
         let annotated_id: i64 = conn
-            .query_row("SELECT id FROM articles WHERE guid = 'annotated'", [], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT id FROM articles WHERE guid = 'annotated'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         insert_highlight(
             &conn,
@@ -2928,8 +3571,16 @@ mod tests {
         let now = chrono::Utc::now().to_rfc3339();
         insert_read_article_published(&conn, feed_id, "fresh", &now);
 
-        assert_eq!(cleanup_old_articles(&conn, 0).unwrap(), 0, "0 days deletes nothing");
-        assert_eq!(cleanup_old_articles(&conn, -30).unwrap(), 0, "negative days deletes nothing");
+        assert_eq!(
+            cleanup_old_articles(&conn, 0).unwrap(),
+            0,
+            "0 days deletes nothing"
+        );
+        assert_eq!(
+            cleanup_old_articles(&conn, -30).unwrap(),
+            0,
+            "negative days deletes nothing"
+        );
 
         let kept: i64 = conn
             .query_row(
@@ -2958,9 +3609,11 @@ mod tests {
         // string compare the dated row wins (the `T`); `datetime()` fixes it.
         let (conn, fixture) = test_db();
         let feed_id: i64 = conn
-            .query_row("SELECT feed_id FROM articles WHERE id = ?1", [fixture], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT feed_id FROM articles WHERE id = ?1",
+                [fixture],
+                |r| r.get(0),
+            )
             .unwrap();
         // Drop the bare fixture article so only the two controlled rows remain.
         conn.execute("DELETE FROM articles WHERE id = ?1", [fixture])
@@ -3046,9 +3699,11 @@ mod tests {
         .unwrap();
 
         let (title, site_url): (String, Option<String>) = conn
-            .query_row("SELECT title, site_url FROM feeds WHERE id = ?1", [feed_id], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
+            .query_row(
+                "SELECT title, site_url FROM feeds WHERE id = ?1",
+                [feed_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
             .unwrap();
         assert_eq!(
             title, "My Custom Name",
@@ -3072,7 +3727,9 @@ mod tests {
             .query_row("SELECT id FROM feeds", [], |r| r.get(0))
             .unwrap();
         let original: String = conn
-            .query_row("SELECT title FROM feeds WHERE id = ?1", [feed_id], |r| r.get(0))
+            .query_row("SELECT title FROM feeds WHERE id = ?1", [feed_id], |r| {
+                r.get(0)
+            })
             .unwrap();
 
         for blank in ["", "   ", "\t\n"] {
@@ -3090,8 +3747,14 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert_eq!(title, original, "a rejected rename must not alter the title");
-        assert!(!custom, "a rejected rename must not set the custom_title flag");
+        assert_eq!(
+            title, original,
+            "a rejected rename must not alter the title"
+        );
+        assert!(
+            !custom,
+            "a rejected rename must not set the custom_title flag"
+        );
     }
 
     #[test]
@@ -3104,7 +3767,9 @@ mod tests {
             .unwrap();
         rename_feed(&conn, feed_id, "  Tech News  ").unwrap();
         let title: String = conn
-            .query_row("SELECT title FROM feeds WHERE id = ?1", [feed_id], |r| r.get(0))
+            .query_row("SELECT title FROM feeds WHERE id = ?1", [feed_id], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(title, "Tech News");
     }
@@ -3121,7 +3786,9 @@ mod tests {
         update_feed_meta(&conn, feed_id, Some("Renamed Upstream"), None, None, None).unwrap();
 
         let title: String = conn
-            .query_row("SELECT title FROM feeds WHERE id = ?1", [feed_id], |r| r.get(0))
+            .query_row("SELECT title FROM feeds WHERE id = ?1", [feed_id], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(title, "Renamed Upstream");
     }
@@ -3150,15 +3817,7 @@ mod tests {
         .unwrap();
 
         // A later refresh serves empty metadata — every field must be ignored.
-        update_feed_meta(
-            &conn,
-            feed_id,
-            Some(""),
-            Some(""),
-            Some(""),
-            Some(""),
-        )
-        .unwrap();
+        update_feed_meta(&conn, feed_id, Some(""), Some(""), Some(""), Some("")).unwrap();
 
         let (title, site_url, description, favicon): (
             String,

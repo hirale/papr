@@ -923,6 +923,12 @@ function SyncSection({ onToast }: { onToast: (m: string) => void }) {
   const providerLabel = (p: api.GReaderProvider) =>
     p === "miniflux" ? "Miniflux" : "FreshRSS";
 
+  useEffect(() => {
+    if (connected && connectedProvider === "miniflux") {
+      setProvider("miniflux");
+    }
+  }, [connected, connectedProvider]);
+
   const connect = async () => {
     if (!url.trim() || !user.trim()) return;
     setBusy(true);
@@ -939,9 +945,11 @@ function SyncSection({ onToast }: { onToast: (m: string) => void }) {
   };
 
   const disconnect = async () => {
+    const previousProvider = connectedProvider;
     setBusy(true);
     try {
       await api.freshrssDisconnect();
+      setProvider(previousProvider === "miniflux" ? "miniflux" : "freshrss");
       await qc.invalidateQueries({ queryKey: ["freshrss-status"] });
       onToast(t("settings.sync.disconnected"));
     } catch (e) {
@@ -954,11 +962,19 @@ function SyncSection({ onToast }: { onToast: (m: string) => void }) {
   const syncNow = async () => {
     setBusy(true);
     try {
-      const n = await api.freshrssSync();
-      // Sync reconciles read/starred state and may add feeds — refresh the
-      // article-bearing caches, not unrelated ones (AI summaries, settings).
-      actions.refreshAfterBulk();
-      onToast(t("settings.sync.syncDone", { count: n }));
+      const result = await api.freshrssSync();
+      // Manual FreshRSS sync can now fetch feed contents too, so refresh the
+      // same article-bearing caches as a normal feed refresh.
+      actions.refreshAfterFetch();
+      onToast(
+        t("settings.sync.syncDone", {
+          count: result.reconciledArticles,
+          newArticles: result.newArticles,
+          remoteUnread: result.remoteUnreadArticles,
+          matchedUnread: result.matchedUnreadArticles,
+          skippedUnread: result.skippedUnreadArticles,
+        }),
+      );
     } catch (e) {
       reportError(e);
     } finally {
@@ -975,7 +991,7 @@ function SyncSection({ onToast }: { onToast: (m: string) => void }) {
   return (
     <>
       <div className="settings-group">
-        <h3 className="settings-group-title">{t("settings.sync.greader")}</h3>
+        <h3 className="settings-group-title">{t("settings.sync.freshRssTitle")}</h3>
         {connected ? (
           <>
             <div className="s-service">
@@ -1017,6 +1033,18 @@ function SyncSection({ onToast }: { onToast: (m: string) => void }) {
             >
               {t("settings.sync.syncHint")}
             </p>
+            {connectedProvider === "freshrss" && (
+              <p
+                style={{
+                  fontSize: 12,
+                  color: "var(--muted)",
+                  marginTop: 6,
+                  lineHeight: 1.5,
+                }}
+              >
+                {t("settings.sync.folderHint")}
+              </p>
+            )}
           </>
         ) : (
           <>
@@ -1024,22 +1052,24 @@ function SyncSection({ onToast }: { onToast: (m: string) => void }) {
               {t("settings.sync.connectHint")}
             </p>
             <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-              <select
-                className="modal-input"
-                style={{ margin: 0 }}
-                value={provider}
-                onChange={(e) =>
-                  setProvider(e.target.value as api.GReaderProvider)
-                }
-                aria-label={t("settings.sync.provider")}
-              >
-                <option value="freshrss">
-                  {t("settings.sync.providerFreshrss")}
-                </option>
-                <option value="miniflux">
-                  {t("settings.sync.providerMiniflux")}
-                </option>
-              </select>
+              {provider === "miniflux" && (
+                <select
+                  className="modal-input"
+                  style={{ margin: 0 }}
+                  value={provider}
+                  onChange={(e) =>
+                    setProvider(e.target.value as api.GReaderProvider)
+                  }
+                  aria-label={t("settings.sync.provider")}
+                >
+                  <option value="freshrss">
+                    {t("settings.sync.providerFreshrss")}
+                  </option>
+                  <option value="miniflux">
+                    {t("settings.sync.providerMiniflux")}
+                  </option>
+                </select>
+              )}
               <input
                 className="modal-input"
                 style={{ margin: 0 }}

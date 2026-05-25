@@ -330,6 +330,7 @@
     },
     "sync": {
       "greader": "GReader 同期",
+      "freshRssTitle": "FreshRSS 同期",
       "provider": "サービス",
       "providerFreshrss": "FreshRSS",
       "providerMiniflux": "Miniflux",
@@ -338,7 +339,8 @@
       "syncNow": "今すぐ同期",
       "disconnect": "接続を解除",
       "syncHint": "同期ではサーバーから購読を取得し、既読／スターの状態を双方向で揃えます。フィード更新のたびに自動でも同期されます。",
-      "connectHint": "自分で構築した FreshRSS または Miniflux サーバーに接続し、複数のデバイス間で購読と閲覧状態を同期します。",
+      "folderHint": "FreshRSS のフォルダーはローカルに反映されます。ローカルでのフィード移動は同期時に上書きされることがあります。",
+      "connectHint": "自分で構築した FreshRSS サーバーに接続し、複数のデバイス間で購読と閲覧状態を同期します。",
       "serverPlaceholder": "サーバーアドレス（例: https://rss.example.com）",
       "userPlaceholder": "ユーザー名",
       "passPlaceholder": "パスワード / API パスワード",
@@ -352,7 +354,7 @@
       "reasonEntitlements": "ネイティブの macOS エンタイトルメントが必要なため、現在は未対応です",
       "connected": "接続しました",
       "disconnected": "接続を解除しました",
-      "syncDone": "同期が完了しました · {{count}} 件の記事の状態を揃えました"
+      "syncDone": "同期が完了しました · FreshRSS 未読 {{remoteUnread}} 件、取り込み {{newArticles}} 件、既存一致 {{matchedUnread}} 件、スキップ {{skippedUnread}} 件、状態変更 {{count}} 件"
     },
     "shortcuts": {
       "navigation": "ナビゲーション",

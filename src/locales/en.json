@@ -330,6 +330,7 @@
     },
     "sync": {
       "greader": "GReader Sync",
+      "freshRssTitle": "FreshRSS Sync",
       "provider": "Service",
       "providerFreshrss": "FreshRSS",
       "providerMiniflux": "Miniflux",
@@ -338,7 +339,8 @@
       "syncNow": "Sync now",
       "disconnect": "Disconnect",
       "syncHint": "Syncing pulls subscriptions from your server and aligns read / starred state both ways. It also runs automatically each time feeds are refreshed.",
-      "connectHint": "Connect to a self-hosted FreshRSS or Miniflux server to sync subscriptions and reading state across devices.",
+      "folderHint": "FreshRSS folders are mirrored locally. Local feed moves may be overwritten on sync.",
+      "connectHint": "Connect to a self-hosted FreshRSS server to sync subscriptions and reading state across devices.",
       "serverPlaceholder": "Server address, e.g. https://rss.example.com",
       "userPlaceholder": "Username",
       "passPlaceholder": "Password / API password",
@@ -352,7 +354,7 @@
       "reasonEntitlements": "Requires native macOS entitlements, not yet supported",
       "connected": "Connected",
       "disconnected": "Disconnected",
-      "syncDone": "Sync complete · aligned the state of {{count}} articles"
+      "syncDone": "Sync complete · FreshRSS unread {{remoteUnread}}; imported {{newArticles}}, matched {{matchedUnread}}, skipped {{skippedUnread}}; {{count}} state changes"
     },
     "shortcuts": {
       "navigation": "Navigation",

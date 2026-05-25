@@ -59,6 +59,7 @@ pub async fn list_feeds(state: State<'_, AppState>) -> AppResult<Vec<Feed>> {
 /// populated, then returns the stored feed.
 #[tauri::command]
 pub async fn add_feed(
+    app: AppHandle,
     state: State<'_, AppState>,
     url: String,
     folder_id: Option<i64>,
@@ -107,11 +108,7 @@ pub async fn add_feed(
     let parsed = parse::parse_feed(&feed_bytes, &feed_url)?;
     let source_type = match forced_type {
         Some(t) => t,
-        None => parse::refine_source_type(
-            parse::detect_source_type(&feed_url),
-            &parsed,
-            &feed_url,
-        ),
+        None => parse::refine_source_type(parse::detect_source_type(&feed_url), &parsed, &feed_url),
     };
 
     let title = parsed
@@ -161,11 +158,16 @@ pub async fn add_feed(
     // all.)
     let _ = db::touch_feed(&conn, feed_id);
     let last_fetched_at = db::feed_last_fetched(&conn, feed_id).ok().flatten();
+    let queued_sync = db::enqueue_freshrss_subscribe_if_connected(&conn, &feed_url)?;
     // Count actual unread rows rather than tallying insertions: keeps the
     // returned `unread_count` aligned with the sidebar's `list_feeds` count
     // regardless of how filter rules pre-set article state.
     let unread = db::count_feed_unread(&conn, feed_id)?;
     drop(conn);
+
+    if queued_sync {
+        crate::sync::trigger_soon(app);
+    }
 
     Ok(Feed {
         id: feed_id,
@@ -231,9 +233,15 @@ pub async fn search_feed_directory(
 }
 
 #[tauri::command]
-pub async fn delete_feed(state: State<'_, AppState>, id: i64) -> AppResult<()> {
-    let conn = state.db.lock().await;
-    db::delete_feed(&conn, id)
+pub async fn delete_feed(app: AppHandle, state: State<'_, AppState>, id: i64) -> AppResult<()> {
+    let queued_sync = {
+        let conn = state.db.lock().await;
+        db::delete_feed_with_freshrss_sync(&conn, id)?
+    };
+    if queued_sync {
+        crate::sync::trigger_soon(app);
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -293,9 +301,18 @@ pub async fn get_article(state: State<'_, AppState>, id: i64) -> AppResult<Artic
 }
 
 /// Queue a read/starred change for FreshRSS, but only when a server is linked.
-fn enqueue_if_connected(conn: &rusqlite::Connection, id: i64, field: &str, value: bool) {
-    if db::is_freshrss_connected(conn) {
-        let _ = db::enqueue_sync(conn, id, field, value);
+/// Returns whether a queued change was written, so callers can schedule a
+/// debounced background sync without doing remote work on every local toggle.
+fn enqueue_if_connected(conn: &rusqlite::Connection, id: i64, field: &str, value: bool) -> bool {
+    if !db::is_freshrss_connected(conn) {
+        return false;
+    }
+    match db::enqueue_sync(conn, id, field, value) {
+        Ok(()) => true,
+        Err(e) => {
+            log::warn!("sync: enqueue {field}={value} for article {id} failed: {e}");
+            false
+        }
     }
 }
 
@@ -308,11 +325,14 @@ async fn refresh_unread_surfaces(app: &AppHandle) {
 
 #[tauri::command]
 pub async fn mark_read(app: AppHandle, id: i64, read: bool) -> AppResult<()> {
-    {
+    let queued = {
         let state = app.state::<AppState>();
         let conn = state.db.lock().await;
         db::set_read(&conn, id, read)?;
-        enqueue_if_connected(&conn, id, "read", read);
+        enqueue_if_connected(&conn, id, "read", read)
+    };
+    if queued {
+        crate::sync::trigger_soon(app.clone());
     }
     refresh_unread_surfaces(&app).await;
     Ok(())
@@ -320,10 +340,15 @@ pub async fn mark_read(app: AppHandle, id: i64, read: bool) -> AppResult<()> {
 
 #[tauri::command]
 pub async fn mark_starred(app: AppHandle, id: i64, starred: bool) -> AppResult<()> {
-    let state = app.state::<AppState>();
-    let conn = state.db.lock().await;
-    db::set_starred(&conn, id, starred)?;
-    enqueue_if_connected(&conn, id, "starred", starred);
+    let queued = {
+        let state = app.state::<AppState>();
+        let conn = state.db.lock().await;
+        db::set_starred(&conn, id, starred)?;
+        enqueue_if_connected(&conn, id, "starred", starred)
+    };
+    if queued {
+        crate::sync::trigger_soon(app.clone());
+    }
     Ok(())
 }
 
@@ -335,11 +360,15 @@ pub async fn mark_read_later(state: State<'_, AppState>, id: i64, value: bool) -
 
 #[tauri::command]
 pub async fn mark_all_read(app: AppHandle, query: ArticleQuery) -> AppResult<usize> {
-    let n = {
+    let (n, connected) = {
         let state = app.state::<AppState>();
         let conn = state.db.lock().await;
-        db::mark_all_read(&conn, &query, db::is_freshrss_connected(&conn))?
+        let connected = db::is_freshrss_connected(&conn);
+        (db::mark_all_read(&conn, &query, connected)?, connected)
     };
+    if connected && n > 0 {
+        crate::sync::trigger_soon(app.clone());
+    }
     let _ = app.emit("feeds-updated", 0);
     refresh_unread_surfaces(&app).await;
     Ok(n)
@@ -399,7 +428,7 @@ pub async fn extract_fulltext(state: State<'_, AppState>, article_id: i64) -> Ap
 #[tauri::command]
 pub async fn import_opml(app: AppHandle, content: String) -> AppResult<usize> {
     let imported = opml::parse(&content)?;
-    let count = {
+    let (count, queued_sync) = {
         let state = app.state::<AppState>();
         let conn = state.db.lock().await;
         // One transaction for the whole import — a mid-list failure rolls
@@ -407,6 +436,7 @@ pub async fn import_opml(app: AppHandle, content: String) -> AppResult<usize> {
         // imported.
         let tx = conn.unchecked_transaction()?;
         let mut added = 0;
+        let mut queued_sync = false;
         for feed in imported {
             if db::find_feed_by_url(&tx, &feed.feed_url)?.is_some() {
                 continue;
@@ -425,11 +455,17 @@ pub async fn import_opml(app: AppHandle, content: String) -> AppResult<usize> {
                 source_type,
                 folder_id,
             )?;
+            if db::enqueue_freshrss_subscribe_if_connected(&tx, &feed.feed_url)? {
+                queued_sync = true;
+            }
             added += 1;
         }
         tx.commit()?;
-        added
+        (added, queued_sync)
     };
+    if queued_sync {
+        crate::sync::trigger_soon(app.clone());
+    }
     // Newly imported feeds have no articles yet — kick off a refresh. Pass
     // wait_if_busy so it queues behind any in-flight refresh instead of
     // skipping and leaving the imported feeds empty until the next tick.
@@ -456,11 +492,7 @@ pub async fn get_setting(state: State<'_, AppState>, key: String) -> AppResult<O
 }
 
 #[tauri::command]
-pub async fn set_setting(
-    state: State<'_, AppState>,
-    key: String,
-    value: String,
-) -> AppResult<()> {
+pub async fn set_setting(state: State<'_, AppState>, key: String, value: String) -> AppResult<()> {
     let conn = state.db.lock().await;
     db::set_setting(&conn, &key, &value)
 }
@@ -515,7 +547,12 @@ pub async fn ai_summarize(
     let (title, body, cfg, lang) = {
         let conn = state.read().await;
         let (title, body) = db::article_text(&conn, article_id)?;
-        (title, body, load_ai_config(&conn)?, response_language(&conn))
+        (
+            title,
+            body,
+            load_ai_config(&conn)?,
+            response_language(&conn),
+        )
     };
     // A title-only item (link-aggregator posts, some podcast/video feeds carry
     // no body text) gives the model nothing to summarize. Without this guard it
@@ -601,10 +638,7 @@ pub async fn ai_ask(
 
 /// Stream an AI briefing that synthesizes the most recent articles by theme.
 #[tauri::command]
-pub async fn ai_digest(
-    state: State<'_, AppState>,
-    on_token: Channel<AiEvent>,
-) -> AppResult<()> {
+pub async fn ai_digest(state: State<'_, AppState>, on_token: Channel<AiEvent>) -> AppResult<()> {
     let (cfg, articles, lang) = {
         let conn = state.read().await;
         (
@@ -697,7 +731,10 @@ pub async fn ai_translate(
         let clean = sanitize::sanitize(translate::strip_code_fence(&text).trim(), None);
         full.push_str(&clean);
         full.push('\n');
-        let _ = on_event.send(TranslateEvent::Batch { html: clean, done: i + 1 });
+        let _ = on_event.send(TranslateEvent::Batch {
+            html: clean,
+            done: i + 1,
+        });
     }
 
     let final_html = full.trim().to_string();
@@ -797,6 +834,19 @@ pub struct FreshRssStatus {
     provider: String,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FreshRssSyncResult {
+    reconciled_articles: usize,
+    new_articles: usize,
+    remote_unread_articles: usize,
+    matched_unread_articles: usize,
+    skipped_unread_articles: usize,
+    skipped_unread_no_stream: usize,
+    skipped_unread_no_feed: usize,
+    skipped_unread_no_identity: usize,
+}
+
 #[tauri::command]
 pub async fn freshrss_connect(
     app: AppHandle,
@@ -827,13 +877,23 @@ pub async fn freshrss_status(app: AppHandle) -> AppResult<FreshRssStatus> {
     })
 }
 
-/// Run a full FreshRSS sync now; returns the number of reconciled articles.
+/// Run a FreshRSS sync now. Remote unread articles are imported from the
+/// GReader content stream, so this does not block on a full local feed crawl.
 #[tauri::command]
-pub async fn freshrss_sync(app: AppHandle) -> AppResult<usize> {
-    let n = crate::sync::sync_now(&app).await?;
+pub async fn freshrss_sync(app: AppHandle) -> AppResult<FreshRssSyncResult> {
+    let stats = crate::sync::sync_now(&app).await?;
     let _ = app.emit("feeds-updated", 0);
     refresh_unread_surfaces(&app).await;
-    Ok(n)
+    Ok(FreshRssSyncResult {
+        reconciled_articles: stats.reconciled_articles,
+        new_articles: stats.imported_articles,
+        remote_unread_articles: stats.remote_unread_articles,
+        matched_unread_articles: stats.matched_unread_articles,
+        skipped_unread_articles: stats.skipped_unread_articles,
+        skipped_unread_no_stream: stats.skipped_unread_no_stream,
+        skipped_unread_no_feed: stats.skipped_unread_no_feed,
+        skipped_unread_no_identity: stats.skipped_unread_no_identity,
+    })
 }
 
 /// Rebuild the tray menu — used after a language change.
@@ -880,11 +940,7 @@ pub async fn rename_tag(state: State<'_, AppState>, id: i64, name: String) -> Ap
 }
 
 #[tauri::command]
-pub async fn set_tag_color(
-    state: State<'_, AppState>,
-    id: i64,
-    color: String,
-) -> AppResult<()> {
+pub async fn set_tag_color(state: State<'_, AppState>, id: i64, color: String) -> AppResult<()> {
     let conn = state.db.lock().await;
     db::set_tag_color(&conn, id, &color)
 }
@@ -947,7 +1003,16 @@ pub async fn update_rule(
         return Err(AppError::code("emptyRuleQuery"));
     }
     let conn = state.db.lock().await;
-    db::update_rule(&conn, id, name.trim(), enabled, feed_id, &field, query.trim(), &action)
+    db::update_rule(
+        &conn,
+        id,
+        name.trim(),
+        enabled,
+        feed_id,
+        &field,
+        query.trim(),
+        &action,
+    )
 }
 
 #[tauri::command]
@@ -1047,7 +1112,11 @@ pub async fn add_newsletter_source(
         password: input.password.clone(),
         folder: {
             let f = input.folder.trim();
-            if f.is_empty() { "INBOX".to_string() } else { f.to_string() }
+            if f.is_empty() {
+                "INBOX".to_string()
+            } else {
+                f.to_string()
+            }
         },
     };
     if cfg.host.is_empty() || cfg.username.is_empty() || cfg.password.is_empty() {
@@ -1084,8 +1153,9 @@ pub async fn add_newsletter_source(
     )
     .await
     {
-        Ok(joined) => joined
-            .map_err(|e| AppError::other(format!("newsletter poll task: {e}")))??,
+        Ok(joined) => {
+            joined.map_err(|e| AppError::other(format!("newsletter poll task: {e}")))??
+        }
         Err(_) => return Err(AppError::code("newsletterPollTimeout")),
     };
 
@@ -1150,10 +1220,7 @@ pub async fn list_newsletter_sources(
 
 /// Remove a newsletter source and all of its ingested articles.
 #[tauri::command]
-pub async fn remove_newsletter_source(
-    state: State<'_, AppState>,
-    feed_id: i64,
-) -> AppResult<()> {
+pub async fn remove_newsletter_source(state: State<'_, AppState>, feed_id: i64) -> AppResult<()> {
     let conn = state.db.lock().await;
     db::delete_newsletter_source(&conn, feed_id)
 }

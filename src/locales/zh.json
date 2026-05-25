@@ -330,6 +330,7 @@
     },
     "sync": {
       "greader": "GReader 同步",
+      "freshRssTitle": "FreshRSS 同步",
       "provider": "服务",
       "providerFreshrss": "FreshRSS",
       "providerMiniflux": "Miniflux",
@@ -338,7 +339,8 @@
       "syncNow": "立即同步",
       "disconnect": "断开连接",
       "syncHint": "同步会从服务器拉取订阅源，并双向对齐已读 / 星标状态。每次刷新订阅时也会自动同步。",
-      "connectHint": "连接自建的 FreshRSS 或 Miniflux 服务器，在多设备间同步订阅与阅读状态。",
+      "folderHint": "FreshRSS 文件夹会同步到本地。本地移动订阅源可能会在同步时被覆盖。",
+      "connectHint": "连接自建的 FreshRSS 服务器，在多设备间同步订阅与阅读状态。",
       "serverPlaceholder": "服务器地址，如 https://rss.example.com",
       "userPlaceholder": "用户名",
       "passPlaceholder": "密码 / API 密码",
@@ -352,7 +354,7 @@
       "reasonEntitlements": "需要原生 macOS entitlements，暂不支持",
       "connected": "已连接",
       "disconnected": "已断开",
-      "syncDone": "同步完成 · 已对齐 {{count}} 篇文章状态"
+      "syncDone": "同步完成 · FreshRSS 未读 {{remoteUnread}} 篇；新增 {{newArticles}}，匹配 {{matchedUnread}}，跳过 {{skippedUnread}}；状态变更 {{count}}"
     },
     "shortcuts": {
       "navigation": "导航",

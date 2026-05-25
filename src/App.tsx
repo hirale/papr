@@ -163,6 +163,7 @@ export default function App() {
   useEffect(() => {
     const un = listen("feeds-updated", () => {
       qc.invalidateQueries({ queryKey: ["feeds"] });
+      qc.invalidateQueries({ queryKey: ["folders"] });
       qc.invalidateQueries({ queryKey: ["counts"] });
       qc.invalidateQueries({ queryKey: ["articles"] });
     });

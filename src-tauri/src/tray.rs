@@ -186,14 +186,15 @@ fn handle_event(app: &AppHandle, event: MenuEvent) {
         "tray_markall" => {
             let app = app.clone();
             tauri::async_runtime::spawn(async move {
-                {
+                let (n, connected) = {
                     let state = app.state::<AppState>();
                     let conn = state.db.lock().await;
-                    let _ = db::mark_all_read(
-                        &conn,
-                        &ArticleQuery::All,
-                        db::is_freshrss_connected(&conn),
-                    );
+                    let connected = db::is_freshrss_connected(&conn);
+                    let n = db::mark_all_read(&conn, &ArticleQuery::All, connected).unwrap_or(0);
+                    (n, connected)
+                };
+                if connected && n > 0 {
+                    crate::sync::trigger_soon(app.clone());
                 }
                 let _ = app.emit("feeds-updated", 0);
                 notify::update_badge(&app).await;

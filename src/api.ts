@@ -163,6 +163,16 @@ export interface FreshRssStatus {
   url: string | null;
   provider: GReaderProvider;
 }
+export interface FreshRssSyncResult {
+  reconciledArticles: number;
+  newArticles: number;
+  remoteUnreadArticles: number;
+  matchedUnreadArticles: number;
+  skippedUnreadArticles: number;
+  skippedUnreadNoStream: number;
+  skippedUnreadNoFeed: number;
+  skippedUnreadNoIdentity: number;
+}
 export const freshrssStatus = () => invoke<FreshRssStatus>("freshrss_status");
 export const freshrssConnect = (
   url: string,
@@ -171,7 +181,7 @@ export const freshrssConnect = (
   provider: GReaderProvider = "freshrss",
 ) => invoke<void>("freshrss_connect", { url, username, password, provider });
 export const freshrssDisconnect = () => invoke<void>("freshrss_disconnect");
-export const freshrssSync = () => invoke<number>("freshrss_sync");
+export const freshrssSync = () => invoke<FreshRssSyncResult>("freshrss_sync");
 
 // ── tray ──
 export const refreshTray = () => invoke<void>("refresh_tray");
