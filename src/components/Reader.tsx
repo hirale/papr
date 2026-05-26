@@ -20,6 +20,7 @@ import ContextMenu, { type MenuEntry } from "./ContextMenu";
 
 interface Props {
   onToast: (msg: string) => void;
+  browserObscured?: boolean;
 }
 
 const READER_BROWSER_LABEL = "papr-reader-browser";
@@ -164,7 +165,7 @@ function makeLinkClickHandler(
   };
 }
 
-export default function Reader({ onToast }: Props) {
+export default function Reader({ onToast, browserObscured = false }: Props) {
   const { t } = useTranslation();
   const actions = useArticleActions(toast.error);
   const id = useUi((s) => s.selectedArticleId);
@@ -183,6 +184,7 @@ export default function Reader({ onToast }: Props) {
   const bodyRef = useRef<HTMLDivElement>(null);
   const browserHostRef = useRef<HTMLDivElement>(null);
   const browserViewRef = useRef<Webview | null>(null);
+  const browserObscuredRef = useRef(browserObscured);
   const playTrack = usePlayer((s) => s.play);
   const playingSrc = usePlayer((s) => (s.playing ? s.track?.src : null));
 
@@ -221,6 +223,13 @@ export default function Reader({ onToast }: Props) {
   const closeBrowserPane = useCallback(() => {
     setBrowserUrl(null);
   }, []);
+
+  useEffect(() => {
+    browserObscuredRef.current = browserObscured;
+    const view = browserViewRef.current;
+    if (!view) return;
+    (browserObscured ? view.hide() : view.show()).catch(reportError);
+  }, [browserObscured]);
 
   useEffect(() => {
     if (!browserUrl) {
@@ -267,7 +276,11 @@ export default function Reader({ onToast }: Props) {
         await view.close().catch(() => {});
         return;
       }
-      await view.setFocus().catch(() => {});
+      if (browserObscuredRef.current) {
+        await view.hide().catch(reportError);
+      } else {
+        await view.setFocus().catch(() => {});
+      }
 
       const resize = () => setBounds(view, host).catch(() => {});
       const observer = new ResizeObserver(resize);

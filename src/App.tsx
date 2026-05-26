@@ -325,7 +325,7 @@ export default function App() {
             refreshing={refreshing}
             onOpenSettings={() => openSettings()}
           />
-          <Reader onToast={showToast} />
+          <Reader onToast={showToast} browserObscured={settings.open || cpOpen} />
         </div>
         <PlayerBar />
       </div>
