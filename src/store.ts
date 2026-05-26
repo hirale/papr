@@ -8,7 +8,6 @@ import * as api from "./api";
 import type { ArticleQuery } from "./types";
 
 export type Theme = "light" | "dark";
-export type Accent = "clay" | "pine" | "indigo" | "ink";
 export type Density = "compact" | "cozy" | "spacious";
 export type ViewMode = "list" | "card";
 export type StartupView = "all" | "unread" | "starred" | "last";
@@ -46,7 +45,6 @@ export interface Prefs {
   showReadingTime: boolean;
   markReadOnOpen: boolean;
   markReadOnScroll: boolean;
-  autoExtract: boolean;
   startupView: StartupView;
   hideReadOnStartup: boolean;
 }
@@ -96,7 +94,6 @@ interface UiState {
 
   // appearance preferences
   theme: Theme;
-  accent: Accent;
   density: Density;
   viewMode: ViewMode;
   readerFont: ReaderFont;
@@ -117,7 +114,6 @@ interface UiState {
   toggleSort: () => void;
 
   setTheme: (t: Theme) => void;
-  setAccent: (a: Accent) => void;
   setDensity: (d: Density) => void;
   setViewMode: (v: ViewMode) => void;
   setReaderFont: (v: ReaderFont) => void;
@@ -136,7 +132,6 @@ const PREF_KEYS: (keyof Prefs)[] = [
   "showReadingTime",
   "markReadOnOpen",
   "markReadOnScroll",
-  "autoExtract",
   "startupView",
   "hideReadOnStartup",
 ];
@@ -165,9 +160,8 @@ function loadPrefs(): Prefs {
     showCardThumbs: ls.bool("pref.showCardThumbs", true),
     reduceMotion: ls.bool("pref.reduceMotion", false),
     showReadingTime: ls.bool("pref.showReadingTime", true),
-    markReadOnOpen: ls.bool("pref.markReadOnOpen", true),
-    markReadOnScroll: ls.bool("pref.markReadOnScroll", false),
-    autoExtract: ls.bool("pref.autoExtract", false),
+    markReadOnOpen: false,
+    markReadOnScroll: false,
     startupView: ls.oneOf<StartupView>(
       "pref.startupView",
       ["all", "unread", "starred", "last"],
@@ -178,14 +172,13 @@ function loadPrefs(): Prefs {
 }
 
 export const useUi = create<UiState>((set) => ({
-  query: { kind: "all" },
-  queryLabel: i18n.t("smart.all"),
+  query: { kind: "unread" },
+  queryLabel: i18n.t("smart.unread"),
   selectedArticleId: null,
-  unreadOnly: false,
-  sortOldest: false,
+  unreadOnly: true,
+  sortOldest: true,
 
   theme: ls.oneOf<Theme>("theme", ["light", "dark"], "light"),
-  accent: ls.oneOf<Accent>("accent", ["clay", "pine", "indigo", "ink"], "clay"),
   density: ls.oneOf<Density>(
     "density",
     ["compact", "cozy", "spacious"],
@@ -218,7 +211,6 @@ export const useUi = create<UiState>((set) => ({
   toggleSort: () => set((s) => ({ sortOldest: !s.sortOldest })),
 
   setTheme: (theme) => { ls.set("theme", theme); mirrorTheme(theme); set({ theme }); },
-  setAccent: (accent) => { ls.set("accent", accent); set({ accent }); },
   setDensity: (density) => { ls.set("density", density); set({ density }); },
   setViewMode: (viewMode) => { ls.set("viewMode", viewMode); set({ viewMode }); },
   setReaderFont: (readerFont) => { ls.set("readerFont", readerFont); set({ readerFont }); },

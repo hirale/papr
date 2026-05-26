@@ -12,6 +12,11 @@ dist
 dist-ssr
 *.local
 
+# Local packaging/build caches
+.cache/
+.pnpm-store/
+artifacts/
+
 # Stray compiler scratch output
 a.out
 

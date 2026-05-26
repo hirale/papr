@@ -3,42 +3,25 @@ import { useTranslation } from "react-i18next";
 import { useQueryClient } from "@tanstack/react-query";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { openUrl } from "@tauri-apps/plugin-opener";
 import * as api from "./api";
 import { useUi, READER_FONTS } from "./store";
 import { useArticleActions } from "./hooks/articleActions";
 import { readCurrentItems } from "./lib/currentList";
-import { checkForUpdates } from "./lib/updater";
+import { openInternalBrowser } from "./lib/internalBrowser";
 import { useToasts, toast as toastApi, reportError } from "./toast";
-import type { ArticleQuery, ArticleSummary, Feed } from "./types";
-import Sidebar from "./components/Sidebar";
+import type { ArticleSummary, Feed } from "./types";
 import ArticleList from "./components/ArticleList";
 import Reader from "./components/Reader";
 import CommandPalette, { type CommandAction } from "./components/CommandPalette";
 import SettingsDialog from "./components/SettingsDialog";
-import AddFeedDialog from "./components/AddFeedDialog";
-import ExploreDialog from "./components/ExploreDialog";
-import PromptDialog from "./components/PromptDialog";
 import PlayerBar from "./components/PlayerBar";
 import Icon from "./components/Icon";
-
-// Accent palettes — ported from the design prototype (app.jsx ACCENTS).
-const ACCENTS: Record<
-  string,
-  { accent: string; soft: string; ink: string; dAccent: string; dSoft: string; dInk: string }
-> = {
-  clay: { accent: "oklch(0.60 0.13 38)", soft: "oklch(0.94 0.04 50)", ink: "oklch(0.42 0.10 38)", dAccent: "oklch(0.74 0.13 45)", dSoft: "oklch(0.32 0.06 40)", dInk: "oklch(0.80 0.10 45)" },
-  pine: { accent: "oklch(0.50 0.10 165)", soft: "oklch(0.94 0.04 160)", ink: "oklch(0.38 0.08 165)", dAccent: "oklch(0.72 0.11 170)", dSoft: "oklch(0.30 0.05 165)", dInk: "oklch(0.80 0.08 170)" },
-  indigo: { accent: "oklch(0.52 0.14 268)", soft: "oklch(0.94 0.04 270)", ink: "oklch(0.40 0.12 268)", dAccent: "oklch(0.74 0.13 270)", dSoft: "oklch(0.30 0.06 268)", dInk: "oklch(0.82 0.10 270)" },
-  ink: { accent: "oklch(0.30 0.02 50)", soft: "oklch(0.92 0.005 50)", ink: "oklch(0.20 0.01 50)", dAccent: "oklch(0.86 0.005 50)", dSoft: "oklch(0.30 0.005 50)", dInk: "oklch(0.92 0.005 50)" },
-};
 
 export default function App() {
   const { t } = useTranslation();
   const qc = useQueryClient();
 
   const theme = useUi((s) => s.theme);
-  const accent = useUi((s) => s.accent);
   const density = useUi((s) => s.density);
   const readerFont = useUi((s) => s.readerFont);
   const readerSize = useUi((s) => s.readerSize);
@@ -54,30 +37,20 @@ export default function App() {
   const [settings, setSettings] = useState<{ open: boolean; section?: string }>({
     open: false,
   });
-  const [addFeed, setAddFeed] = useState(false);
-  // Feed URL handed over by a `papr://subscribe` deep link (browser extension).
-  const [addFeedUrl, setAddFeedUrl] = useState<string | undefined>(undefined);
-  // The standalone Explore (curated-directory marketplace) dialog.
-  const [explore, setExplore] = useState(false);
-  const [newFolder, setNewFolder] = useState(false);
 
   // ── apply appearance to the document root ──
   useEffect(() => {
     const root = document.documentElement;
     root.dataset.theme = theme;
     root.dataset.density = density;
-    const a = ACCENTS[accent] ?? ACCENTS.clay;
     const dark = theme === "dark";
-    root.style.setProperty("--accent", dark ? a.dAccent : a.accent);
-    root.style.setProperty("--accent-soft", dark ? a.dSoft : a.soft);
-    root.style.setProperty("--accent-ink", dark ? a.dInk : a.ink);
     // Keep the native window/webview background on the themed paper colour, so
     // a live window resize never flashes a mismatched colour in the strip the
     // webview has not repainted yet. Mirrors --paper in styles.css.
     getCurrentWindow()
-      .setBackgroundColor(dark ? "#16140F" : "#F6F3EC")
+      .setBackgroundColor(dark ? "#121212" : "#F7F7F7")
       .catch(() => {});
-  }, [theme, accent, density]);
+  }, [theme, density]);
 
   // ── dismiss the boot splash once the app shell has mounted ──
   useEffect(() => {
@@ -92,45 +65,12 @@ export default function App() {
     document.documentElement.dataset.reduceMotion = String(reduceMotion);
   }, [reduceMotion]);
 
-  // Apply the startup view preference once, on first mount.
+  // Always start in the FreshRSS unread queue: unread only, oldest first.
   useEffect(() => {
-    const { startupView, hideReadOnStartup } = useUi.getState().prefs;
-    // Smart-view header labels in the *current* UI language. Smart-view
-    // selections persist a translated label into `lastView`; re-deriving it
-    // here keeps the header correct after a language switch (a feed/folder/tag
-    // label is a proper name, so that case keeps the persisted value).
-    const labels: Record<string, string> = {
-      all: t("smart.all"),
-      unread: t("smart.unread"),
-      starred: t("smart.starred"),
-      readLater: t("smart.readLater"),
-    };
-    if (startupView !== "last" && labels[startupView]) {
-      useUi
-        .getState()
-        .select({ kind: startupView } as ArticleQuery, labels[startupView]);
-    } else if (startupView === "last") {
-      // Restore the view that was open when the app last closed.
-      try {
-        const raw = localStorage.getItem("lastView");
-        if (raw) {
-          const saved = JSON.parse(raw) as { query?: ArticleQuery; label?: string };
-          if (saved.query?.kind) {
-            // The persisted label was captured in whatever language was
-            // active when the view was last selected — for a smart view it
-            // would now be stale if the user has since changed languages, so
-            // re-translate it from the current locale.
-            const label = labels[saved.query.kind] ?? saved.label ?? "";
-            useUi.getState().select(saved.query, label);
-          }
-        }
-      } catch {
-        /* ignore a corrupt persisted value */
-      }
-    }
-    if (hideReadOnStartup && !useUi.getState().unreadOnly) {
-      useUi.getState().toggleUnreadOnly();
-    }
+    const st = useUi.getState();
+    st.select({ kind: "unread" }, t("smart.unread"));
+    if (!st.unreadOnly) st.toggleUnreadOnly();
+    if (!st.sortOldest) st.toggleSort();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -180,45 +120,11 @@ export default function App() {
     };
   }, []);
 
-  // ── papr://subscribe deep links from the browser extension (F6) ──
-  useEffect(() => {
-    const un = listen<string>("deep-link-subscribe", (e) => {
-      setAddFeedUrl(e.payload);
-      setAddFeed(true);
-    });
-    // A cold-start link arrives during the backend's `setup()` — before this
-    // listener exists — so the `emit` above is dropped. The backend buffers
-    // that URL; drain it once on mount so a launch-by-deep-link still opens
-    // the Add-feed dialog.
-    api
-      .takePendingDeepLink()
-      .then((url) => {
-        if (url) {
-          setAddFeedUrl(url);
-          setAddFeed(true);
-        }
-      })
-      .catch(() => {});
-    return () => {
-      un.then((f) => f());
-    };
-  }, []);
-
-  // ── Auto-update: one quiet check shortly after launch ──
-  // Delayed so it doesn't compete with the first feed refresh for bandwidth;
-  // `silent` keeps a missing release feed (or a dev build) from raising noise.
-  useEffect(() => {
-    const id = window.setTimeout(() => {
-      void checkForUpdates({ silent: true });
-    }, 4000);
-    return () => window.clearTimeout(id);
-  }, []);
-
   // A ref — not the `refreshing` state — is the concurrency guard: it must be
   // read-and-set synchronously, and the kick-off has side effects (a network
   // refresh, a toast). A setState updater must stay pure; React invokes it
   // twice under StrictMode, which previously fired the refresh twice in dev.
-  // `refreshing` state is kept purely to drive the sidebar spinner.
+  // `refreshing` state is kept purely to drive the list-header refresh spinner.
   const refreshingRef = useRef(false);
   const doRefresh = useCallback(() => {
     if (refreshingRef.current) return;
@@ -226,13 +132,14 @@ export default function App() {
     setRefreshing(true);
     showToast(t("app.refreshing"));
     api
-      .refreshFeeds()
-      .then((n) => {
-        // Refresh only the caches a feed fetch can actually change — a bare
-        // `invalidateQueries()` would also refetch unrelated queries (rules,
-        // FreshRSS status, the open feed-discovery search).
+      .freshrssSync()
+      .then((result) => {
         actions.refreshAfterFetch();
-        showToast(n > 0 ? t("app.foundNew", { count: n }) : t("app.upToDate"));
+        showToast(
+          result.newArticles > 0
+            ? t("app.foundNew", { count: result.newArticles })
+            : t("app.upToDate"),
+        );
       })
       .catch(reportError)
       .finally(() => {
@@ -268,9 +175,6 @@ export default function App() {
           useUi.getState().setAiOpen(!useUi.getState().aiOpen);
         break;
       case "refresh": doRefresh(); break;
-      case "add-feed": setAddFeed(true); break;
-      case "new-folder": setNewFolder(true); break;
-      case "opml": openSettings("subscriptions"); break;
       case "open-settings": openSettings(); break;
     }
   };
@@ -373,20 +277,9 @@ export default function App() {
         case "j": e.preventDefault(); go(idx < 0 ? 0 : 1); break;
         case "k": e.preventDefault(); go(-1); break;
         case "o":
-          if (sel?.url) { e.preventDefault(); openUrl(sel.url).catch(() => {}); }
-          break;
-        case "s":
-          if (sel) {
+          if (sel?.url) {
             e.preventDefault();
-            actions.setStarred(sel.id, !sel.isStarred);
-            showToast(sel.isStarred ? t("app.starRemoved") : t("app.starred"), "S");
-          }
-          break;
-        case "b":
-          if (sel) {
-            e.preventDefault();
-            actions.setReadLater(sel.id, !sel.readLater);
-            showToast(sel.readLater ? t("app.readLaterRemoved") : t("app.readLaterAdded"), "B");
+            openInternalBrowser(sel.url, sel.title).catch(reportError);
           }
           break;
         case "u":
@@ -399,10 +292,8 @@ export default function App() {
           }
           break;
         case "f": e.preventDefault(); st.setFocusMode(!st.focusMode); break;
-        case "v": e.preventDefault(); st.toggleUnreadOnly(); break;
         case "a":
           if (e.shiftKey) { e.preventDefault(); markAllRead(); }
-          else { e.preventDefault(); setAddFeed(true); }
           break;
         case "d":
           if (e.shiftKey) {
@@ -428,16 +319,12 @@ export default function App() {
     <>
       <div className="app-shell">
         <div className={`window ${focusMode ? "focus" : ""}`}>
-          <Sidebar
-            onAddFeed={() => setAddFeed(true)}
-            onExplore={() => setExplore(true)}
-            onOpenSettings={openSettings}
-            onSearchClick={() => setCpOpen(true)}
+          <ArticleList
+            onToast={showToast}
             onRefresh={doRefresh}
             refreshing={refreshing}
-            onToast={showToast}
+            onOpenSettings={() => openSettings()}
           />
-          <ArticleList onToast={showToast} />
           <Reader onToast={showToast} />
         </div>
         <PlayerBar />
@@ -456,45 +343,7 @@ export default function App() {
           onClose={() => setSettings({ open: false })}
           onToast={showToast}
           initialSection={settings.section}
-          onAddFeed={() => {
-            setSettings({ open: false });
-            setAddFeed(true);
-          }}
-        />
-      )}
-
-      {addFeed && (
-        <AddFeedDialog
-          onClose={() => {
-            setAddFeed(false);
-            setAddFeedUrl(undefined);
-          }}
-          onToast={showToast}
-          initialUrl={addFeedUrl}
-        />
-      )}
-
-      {explore && (
-        <ExploreDialog
-          onClose={() => setExplore(false)}
-          onToast={showToast}
-        />
-      )}
-
-      {newFolder && (
-        <PromptDialog
-          title={t("app.newFolderTitle")}
-          placeholder={t("app.folderNamePlaceholder")}
-          onSubmit={(v) =>
-            api
-              .createFolder(v)
-              .then(() => {
-                qc.invalidateQueries({ queryKey: ["folders"] });
-                showToast(t("app.folderCreated"));
-              })
-              .catch(reportError)
-          }
-          onClose={() => setNewFolder(false)}
+          onAddFeed={() => setSettings({ open: false })}
         />
       )}
 

@@ -5,7 +5,6 @@
 //! quick actions. It is rebuilt after every refresh and on language change.
 
 use crate::db;
-use crate::ingestion::scheduler;
 use crate::models::ArticleQuery;
 use crate::notify;
 use crate::state::AppState;
@@ -180,7 +179,15 @@ fn handle_event(app: &AppHandle, event: MenuEvent) {
         "tray_refresh" => {
             let app = app.clone();
             tauri::async_runtime::spawn(async move {
-                let _ = scheduler::refresh_all(&app, None, false).await;
+                match crate::sync::run_if_connected(&app).await {
+                    Ok(true) => {
+                        let _ = app.emit("feeds-updated", 0);
+                        notify::update_badge(&app).await;
+                        refresh(&app).await;
+                    }
+                    Ok(false) => {}
+                    Err(e) => log::warn!("tray FreshRSS sync failed: {e}"),
+                }
             });
         }
         "tray_markall" => {

@@ -16,9 +16,6 @@ export type CommandAction =
   | "toggle-focus"
   | "toggle-ai"
   | "refresh"
-  | "add-feed"
-  | "new-folder"
-  | "opml"
   | "open-settings";
 
 interface Props {
@@ -45,9 +42,6 @@ const ACTIONS: { icon: IconName; labelKey: string; hint: string; action: Command
   { icon: "focus", labelKey: "commandPalette.actionToggleFocus", hint: "F", action: "toggle-focus" },
   { icon: "sparkle", labelKey: "commandPalette.actionToggleAi", hint: "I", action: "toggle-ai" },
   { icon: "refresh", labelKey: "commandPalette.actionRefresh", hint: modCombo("R"), action: "refresh" },
-  { icon: "plus", labelKey: "commandPalette.actionAddFeed", hint: "A", action: "add-feed" },
-  { icon: "folder", labelKey: "commandPalette.actionNewFolder", hint: "", action: "new-folder" },
-  { icon: "open", labelKey: "commandPalette.actionOpml", hint: "", action: "opml" },
   { icon: "settings", labelKey: "commandPalette.actionOpenSettings", hint: modCombo(","), action: "open-settings" },
 ];
 
@@ -156,7 +150,7 @@ export default function CommandPalette({
         out.push({
           id: `article-${a.id}`,
           group: "article",
-          icon: a.isStarred ? "star-fill" : "rss",
+          icon: "rss",
           label: a.title,
           hint: relTime(a.publishedAt),
           run: () => onNavigateArticle(a),

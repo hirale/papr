@@ -5,8 +5,17 @@
   "windows": ["main"],
   "permissions": [
     "core:default",
+    "core:window:allow-create",
+    "core:window:allow-close",
     "core:window:allow-start-dragging",
     "core:window:allow-set-background-color",
+    "core:webview:allow-create-webview",
+    "core:webview:allow-create-webview-window",
+    "core:webview:allow-webview-close",
+    "core:webview:allow-webview-show",
+    "core:webview:allow-set-webview-focus",
+    "core:webview:allow-set-webview-position",
+    "core:webview:allow-set-webview-size",
     "opener:default",
     "opener:allow-open-url",
     "notification:default",
@@ -14,8 +23,6 @@
     "autostart:allow-enable",
     "autostart:allow-disable",
     "autostart:allow-is-enabled",
-    "deep-link:default",
-    "updater:default",
-    "process:default"
+    "deep-link:default"
   ]
 }

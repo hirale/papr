@@ -6,7 +6,6 @@ mod ai;
 mod commands;
 mod db;
 mod error;
-mod extraction;
 mod ingestion;
 mod models;
 mod notify;
@@ -55,7 +54,7 @@ const READ_POOL_SIZE: usize = 4;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let mut builder = tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_os::init())
@@ -65,15 +64,6 @@ pub fn run() {
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
         ));
-
-    // Desktop-only in-app update: the updater plugin pulls signed bundles from
-    // the GitHub release feed; the process plugin performs the relaunch.
-    #[cfg(desktop)]
-    {
-        builder = builder
-            .plugin(tauri_plugin_updater::Builder::new().build())
-            .plugin(tauri_plugin_process::init());
-    }
 
     builder
         .setup(|app| {
@@ -136,7 +126,7 @@ pub fn run() {
             if theme.as_deref() == Some("dark") {
                 if let Some(win) = app.get_webview_window("main") {
                     let _ = win.set_background_color(Some(tauri::window::Color(
-                        0x16, 0x14, 0x0F, 0xFF,
+                        0x12, 0x12, 0x12, 0xFF,
                     )));
                 }
             }
@@ -203,7 +193,6 @@ pub fn run() {
             commands::mark_read_later,
             commands::mark_all_read,
             commands::smart_counts,
-            commands::extract_fulltext,
             commands::import_opml,
             commands::export_opml,
             commands::get_setting,

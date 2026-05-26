@@ -2,14 +2,13 @@ import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { openUrl } from "@tauri-apps/plugin-opener";
 import * as api from "../api";
 import { useUi } from "../store";
 import { useArticleActions } from "../hooks/articleActions";
 import { relTime } from "../lib/feedMeta";
 import { isMac, modCombo } from "../lib/platform";
+import { openInternalBrowser } from "../lib/internalBrowser";
 import { reportError, toast } from "../toast";
-import { clampToViewport } from "../lib/viewport";
 import type { ArticleSummary, Feed } from "../types";
 import Icon from "./Icon";
 import ContextMenu, { type MenuEntry } from "./ContextMenu";
@@ -18,28 +17,28 @@ const PAGE = 60;
 
 interface Props {
   onToast: (msg: string) => void;
+  onRefresh: () => void;
+  refreshing: boolean;
+  onOpenSettings: () => void;
 }
 
-interface Hover {
-  article: ArticleSummary;
-  top: number;
-  left: number;
-}
-
-export default function ArticleList({ onToast }: Props) {
+export default function ArticleList({
+  onToast,
+  onRefresh,
+  refreshing,
+  onOpenSettings,
+}: Props) {
   const { t } = useTranslation();
   const actions = useArticleActions(toast.error);
   const query = useUi((s) => s.query);
   const queryLabel = useUi((s) => s.queryLabel);
-  const unreadOnly = useUi((s) => s.unreadOnly);
-  const toggleUnreadOnly = useUi((s) => s.toggleUnreadOnly);
-  const sortOldest = useUi((s) => s.sortOldest);
-  const toggleSort = useUi((s) => s.toggleSort);
   const viewMode = useUi((s) => s.viewMode);
   const density = useUi((s) => s.density);
   const showCardThumbs = useUi((s) => s.prefs.showCardThumbs);
   const selectedId = useUi((s) => s.selectedArticleId);
   const openArticle = useUi((s) => s.openArticle);
+  const unreadOnly = true;
+  const sortOldest = true;
 
   const feeds = useQuery({ queryKey: ["feeds"], queryFn: api.listFeeds });
   const feedById = useMemo(() => {
@@ -53,8 +52,6 @@ export default function ArticleList({ onToast }: Props) {
     y: number;
     article: ArticleSummary;
   } | null>(null);
-  const [hover, setHover] = useState<Hover | null>(null);
-  const hoverTimer = useRef<number | undefined>(undefined);
 
   const browse = useInfiniteQuery({
     queryKey: ["articles", query, unreadOnly, sortOldest],
@@ -75,10 +72,10 @@ export default function ArticleList({ onToast }: Props) {
     viewMode === "card"
       ? 320
       : density === "compact"
-        ? 78
+        ? 112
         : density === "spacious"
-          ? 122
-          : 98;
+          ? 164
+          : 136;
   const virt = useVirtualizer({
     count: items.length,
     getScrollElement: () => scrollRef.current,
@@ -110,18 +107,6 @@ export default function ArticleList({ onToast }: Props) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedId]);
 
-  useEffect(() => () => window.clearTimeout(hoverTimer.current), []);
-
-  // Dismiss any hover preview (shown or still pending) when the list contents
-  // change — switching feed/folder/tag, or toggling the unread / sort filters.
-  // The hovered row is unmounted by the re-render without firing `mouseleave`,
-  // so without this the preview lingers over the new list (or a pending timer
-  // fires later and measures a now-detached row, placing the preview at 0,0).
-  useEffect(() => {
-    window.clearTimeout(hoverTimer.current);
-    setHover(null);
-  }, [query, unreadOnly, sortOldest]);
-
   // Jump back to the top of the list whenever the sidebar selection changes.
   // The scroll container stays mounted across the query swap, so without this
   // a new feed/folder/tag opens scrolled to wherever the *previous* list was
@@ -147,25 +132,6 @@ export default function ArticleList({ onToast }: Props) {
     }
   };
 
-  const onHover = (a: ArticleSummary, e: React.MouseEvent) => {
-    window.clearTimeout(hoverTimer.current);
-    // Hold the row element, not a rect snapshot: the preview only appears
-    // 650ms later, and the list is scrollable — measuring at hover time would
-    // anchor the preview to where the row *was*, so a scroll during the delay
-    // (a common "scroll, then pause on a row" gesture) leaves it floating over
-    // unrelated rows or off-screen. Re-measure inside the timer instead, when
-    // the preview actually opens, so it tracks the row's live position.
-    const row = e.currentTarget;
-    hoverTimer.current = window.setTimeout(() => {
-      const rect = row.getBoundingClientRect();
-      setHover({ article: a, top: rect.top + 4, left: rect.right + 12 });
-    }, 650);
-  };
-  const leaveHover = () => {
-    window.clearTimeout(hoverTimer.current);
-    setHover(null);
-  };
-
   const articleMenu = (a: ArticleSummary): MenuEntry[] => [
     { icon: "open", label: t("articleList.menuOpen"), shortcut: "⏎", onClick: () => openArticle(a.id) },
     ...(a.url
@@ -174,25 +140,11 @@ export default function ArticleList({ onToast }: Props) {
             icon: "globe",
             label: t("articleList.menuOpenInBrowser"),
             shortcut: modCombo("O"),
-            onClick: () => openUrl(a.url!).catch(() => {}),
+            onClick: () => openInternalBrowser(a.url!, a.title).catch(reportError),
           },
         ] as MenuEntry[])
       : []),
     { separator: true },
-    {
-      icon: a.isStarred ? "star-fill" : "star",
-      label: a.isStarred ? t("articleList.menuUnstar") : t("articleList.menuStar"),
-      shortcut: "S",
-      onClick: () => actions.setStarred(a.id, !a.isStarred),
-    },
-    {
-      icon: a.readLater ? "bookmark-fill" : "bookmark",
-      label: a.readLater
-        ? t("articleList.menuRemoveReadLater")
-        : t("articleList.menuAddReadLater"),
-      shortcut: "B",
-      onClick: () => actions.setReadLater(a.id, !a.readLater),
-    },
     {
       icon: a.isRead ? "circle" : "check",
       label: a.isRead ? t("articleList.menuMarkUnread") : t("articleList.menuMarkRead"),
@@ -240,32 +192,41 @@ export default function ArticleList({ onToast }: Props) {
   return (
     <div className="list" role="region" aria-labelledby="article-list-title">
       <div className="list-header" {...(isMac && { "data-tauri-drag-region": true })}>
-        <h1 className="list-title" id="article-list-title">
-          {/* Smart views re-translate live; feed/folder/tag keep their own title. */}
-          {query.kind === "feed" ||
-          query.kind === "folder" ||
-          query.kind === "tag"
-            ? queryLabel
-            : t(`smart.${query.kind}`)}
-          <span className="count">{browse.isLoading ? t("common.loading") : showCount}</span>
-        </h1>
+        <div className="list-title-row">
+          <h1 className="list-title" id="article-list-title">
+            {/* Smart views re-translate live; feed/folder/tag keep their own title. */}
+            {query.kind === "feed" ||
+            query.kind === "folder" ||
+            query.kind === "tag"
+              ? queryLabel
+              : t(`smart.${query.kind}`)}
+            <span className="count">{browse.isLoading ? t("common.loading") : showCount}</span>
+          </h1>
+          <div className="list-header-actions">
+            <button
+              className={`list-icon-btn ${refreshing ? "spinning" : ""}`}
+              onClick={onRefresh}
+              title={t("settings.sync.syncNow")}
+              aria-label={t("settings.sync.syncNow")}
+              disabled={refreshing}
+            >
+              <Icon name="refresh" size={15} />
+            </button>
+            <button
+              className="list-icon-btn"
+              onClick={onOpenSettings}
+              title={t("settings.title")}
+              aria-label={t("settings.title")}
+            >
+              <Icon name="settings" size={15} />
+            </button>
+          </div>
+        </div>
         <div className="list-meta">
-          <button
-            className={`list-meta-btn ${!sortOldest ? "on" : ""}`}
-            onClick={toggleSort}
-            title={t("articleList.sort")}
-          >
-            <Icon name={sortOldest ? "arrow-up" : "arrow-down"} size={12} />
-            {sortOldest ? t("articleList.oldestFirst") : t("articleList.newestFirst")}
-          </button>
-          <button
-            className={`list-meta-btn ${unreadOnly ? "on" : ""}`}
-            onClick={toggleUnreadOnly}
-            title={t("articleList.hideRead")}
-          >
-            <Icon name={unreadOnly ? "eye-off" : "eye"} size={12} />
-            {unreadOnly ? t("articleList.unreadOnly") : t("smart.all")}
-          </button>
+          <span className="list-fixed-filter">
+            <Icon name="arrow-up" size={12} />
+            {t("articleList.oldestFirst")}
+          </span>
           <div style={{ flex: 1 }} />
           <button
             className="list-meta-btn"
@@ -278,7 +239,10 @@ export default function ArticleList({ onToast }: Props) {
         </div>
       </div>
 
-      <div className="list-scroll" ref={scrollRef}>
+      <div
+        className="list-scroll"
+        ref={scrollRef}
+      >
         {browse.isLoading && (
           <div>
             {Array.from({ length: 7 }).map((_, i) => (
@@ -336,6 +300,7 @@ export default function ArticleList({ onToast }: Props) {
             {vItems.map((vi) => {
               const a = items[vi.index];
               const feed = feedById[a.feedId];
+              const hasThumb = showCardThumbs && !!a.imageUrl;
               return (
                 // Key by the virtual slot, not the article id. The window of
                 // rendered rows is a fixed band that slides as you scroll, so
@@ -362,7 +327,7 @@ export default function ArticleList({ onToast }: Props) {
                   <div
                     className={`art ${viewMode === "card" ? "card" : ""} ${
                       selectedId === a.id ? "active" : ""
-                    } ${a.isRead ? "read" : ""}`}
+                    } ${a.isRead ? "read" : ""} ${hasThumb ? "has-thumb" : "no-thumb"}`}
                     role="option"
                     id={`option-article-${a.id}`}
                     aria-selected={selectedId === a.id}
@@ -371,33 +336,24 @@ export default function ArticleList({ onToast }: Props) {
                       e.preventDefault();
                       setMenu({ x: e.clientX, y: e.clientY, article: a });
                     }}
-                    onMouseEnter={(e) => onHover(a, e)}
-                    onMouseLeave={leaveHover}
                   >
-                    {viewMode === "card" && showCardThumbs && (
+                    {hasThumb && (
                       <CardThumb article={a} />
                     )}
-                    <div className="art-head">
-                      {!a.isRead && <span className="art-dot" />}
-                      <span className="art-feed">{a.feedTitle}</span>
-                      {feed && feed.sourceType !== "rss" && (
-                        <span className="src-badge">{feed.sourceType}</span>
-                      )}
-                      <span className="art-sep">·</span>
-                      <span className="art-time">{relTime(a.publishedAt)}</span>
-                      {a.isStarred && (
-                        <span className="art-star">
-                          <Icon name="star-fill" size={12} />
-                        </span>
-                      )}
-                      {a.readLater && !a.isStarred && (
-                        <span className="art-star">
-                          <Icon name="bookmark-fill" size={12} />
-                        </span>
-                      )}
+                    <div className="art-main">
+                      <div className="art-head">
+                        {!a.isRead && <span className="art-dot" />}
+                        <span className="art-feed">{a.feedTitle}</span>
+                        {feed && feed.sourceType !== "rss" && (
+                          <span className="src-badge">{feed.sourceType}</span>
+                        )}
+                      </div>
+                      <div className="art-title-row">
+                        <h3 className="art-title">{a.title}</h3>
+                        <span className="art-time">{relTime(a.publishedAt)}</span>
+                      </div>
+                      {a.snippet && <p className="art-snippet">{a.snippet}</p>}
                     </div>
-                    <h3 className="art-title">{a.title}</h3>
-                    {a.snippet && <p className="art-snippet">{a.snippet}</p>}
                   </div>
                 </div>
               );
@@ -406,8 +362,6 @@ export default function ArticleList({ onToast }: Props) {
         )}
         <div style={{ height: 60 }} />
       </div>
-
-      {hover && <HoverPreview {...hover} feedTitle={hover.article.feedTitle} />}
 
       {menu && (
         <ContextMenu
@@ -449,35 +403,6 @@ function CardThumb({ article }: { article: ArticleSummary }) {
           objectFit: "cover",
         }}
       />
-    </div>
-  );
-}
-
-function HoverPreview({
-  article,
-  top,
-  left,
-  feedTitle,
-}: Hover & { feedTitle: string }) {
-  // Clamp the preview inside the viewport. The card is a fixed 340px wide;
-  // the 192px height below pairs with the 8px margin to keep the historical
-  // `innerHeight - 200` bottom pull-back. The shared helper bounds both edges
-  // so a narrow/short window can't shove the preview off the top-left corner.
-  const { left: adjLeft, top: adjTop } = clampToViewport({
-    x: left,
-    y: top,
-    width: 340,
-    height: 192,
-    margin: 8,
-  });
-  return (
-    <div className="hover-preview" style={{ top: adjTop, left: adjLeft }}>
-      <div className="hp-feed">{feedTitle}</div>
-      <div className="hp-title">{article.title}</div>
-      {article.snippet && <div className="hp-body">{article.snippet}</div>}
-      <div className="hp-meta">
-        {[article.author, relTime(article.publishedAt)].filter(Boolean).join(" · ")}
-      </div>
     </div>
   );
 }

@@ -11,7 +11,6 @@ import { LANGUAGES, setLanguage, type Language } from "../i18n";
 import { feedHost } from "../lib/feedMeta";
 import { modKey, modCombo } from "../lib/platform";
 import { reportError } from "../toast";
-import { checkForUpdates } from "../lib/updater";
 import { downloadFile } from "../lib/download";
 import type { Feed, Rule, RuleAction, RuleField, RulePreview } from "../types";
 import Icon, { type IconName } from "./Icon";
@@ -27,15 +26,10 @@ interface Props {
 
 // `labelKey` holds an i18n key — resolved with t() at render time.
 const SECTIONS: { id: string; labelKey: string; icon: IconName; color: string }[] = [
-  { id: "general", labelKey: "settings.nav.general", icon: "settings", color: "#7a756c" },
   { id: "appearance", labelKey: "settings.nav.appearance", icon: "globe", color: "#bb6743" },
   { id: "reading", labelKey: "settings.nav.reading", icon: "eye", color: "#3a4cb8" },
-  { id: "subscriptions", labelKey: "settings.nav.subscriptions", icon: "rss", color: "#d97706" },
-  { id: "filters", labelKey: "settings.nav.filters", icon: "mute", color: "#9333ea" },
   { id: "sync", labelKey: "settings.nav.sync", icon: "refresh", color: "#2c8a3e" },
-  { id: "shortcuts", labelKey: "settings.nav.shortcuts", icon: "command", color: "#5a5fc4" },
-  { id: "notifications", labelKey: "settings.nav.notifications", icon: "inbox", color: "#a8501f" },
-  { id: "advanced", labelKey: "settings.nav.advanced", icon: "sort", color: "#4a4a4a" },
+  { id: "ai", labelKey: "settings.advanced.aiSummary", icon: "sparkle", color: "#5a5fc4" },
   { id: "about", labelKey: "settings.nav.about", icon: "sparkle", color: "#111" },
 ];
 
@@ -66,7 +60,10 @@ export default function SettingsDialog({
   onAddFeed,
 }: Props) {
   const { t } = useTranslation();
-  const [section, setSection] = useState(initialSection ?? "general");
+  const initial = SECTIONS.some((s) => s.id === initialSection)
+    ? initialSection!
+    : "sync";
+  const [section, setSection] = useState(initial);
   const feeds = useQuery({ queryKey: ["feeds"], queryFn: api.listFeeds });
   const windowRef = useRef<HTMLDivElement>(null);
   const version = useAppVersion();
@@ -93,6 +90,7 @@ export default function SettingsDialog({
     subscriptions: t("settings.sub.subscriptions", { count: feedCount }),
     filters: t("settings.sub.filters"),
     sync: t("settings.sub.sync"),
+    ai: t("settings.advanced.aiSummary"),
     shortcuts: t("settings.sub.shortcuts"),
     notifications: t("settings.sub.notifications"),
     advanced: t("settings.sub.advanced"),
@@ -160,6 +158,7 @@ export default function SettingsDialog({
               <FiltersSection feeds={feeds.data ?? []} onToast={onToast} />
             )}
             {section === "sync" && <SyncSection onToast={onToast} />}
+            {section === "ai" && <AiSettingsGroup onToast={onToast} />}
             {section === "shortcuts" && <ShortcutsSection />}
             {section === "notifications" && <NotificationsSection />}
             {section === "advanced" && <AdvancedSection onToast={onToast} />}
@@ -499,24 +498,6 @@ function GeneralSection() {
         )}
       </div>
       <div className="settings-group">
-        <h3 className="settings-group-title">{t("settings.general.readBehavior")}</h3>
-        <Row label={t("settings.general.markReadOnOpen")}>
-          <Toggle
-            checked={prefs.markReadOnOpen}
-            onChange={(v) => setPref({ markReadOnOpen: v })}
-          />
-        </Row>
-        <Row
-          label={t("settings.general.markReadOnScroll")}
-          desc={t("settings.general.markReadOnScrollDesc")}
-        >
-          <Toggle
-            checked={prefs.markReadOnScroll}
-            onChange={(v) => setPref({ markReadOnScroll: v })}
-          />
-        </Row>
-      </div>
-      <div className="settings-group">
         <h3 className="settings-group-title">{t("settings.general.startup")}</h3>
         <LaunchAtLogin />
         <Row
@@ -528,7 +509,6 @@ function GeneralSection() {
             options={[
               { value: "all", label: t("settings.general.startupAll") },
               { value: "unread", label: t("smart.unread") },
-              { value: "starred", label: t("smart.starred") },
               { value: "last", label: t("settings.general.startupLast") },
             ]}
             onChange={(v) => setPref({ startupView: v })}
@@ -550,21 +530,10 @@ function AppearanceSection() {
   const { t, i18n } = useTranslation();
   const theme = useUi((s) => s.theme);
   const setTheme = useUi((s) => s.setTheme);
-  const accent = useUi((s) => s.accent);
-  const setAccent = useUi((s) => s.setAccent);
   const density = useUi((s) => s.density);
   const setDensity = useUi((s) => s.setDensity);
-  const viewMode = useUi((s) => s.viewMode);
-  const setViewMode = useUi((s) => s.setViewMode);
   const prefs = useUi((s) => s.prefs);
   const setPref = useUi((s) => s.setPref);
-
-  const accents = [
-    { value: "clay", color: "#bb6743", label: t("settings.appearance.accentClay") },
-    { value: "pine", color: "#3d7a5e", label: t("settings.appearance.accentPine") },
-    { value: "indigo", color: "#5a5fc4", label: t("settings.appearance.accentIndigo") },
-    { value: "ink", color: "#2b2620", label: t("settings.appearance.accentInk") },
-  ] as const;
 
   return (
     <>
@@ -596,24 +565,6 @@ function AppearanceSection() {
             onChange={setTheme}
           />
         </Row>
-        <Row
-          label={t("settings.appearance.accent")}
-          desc={t("settings.appearance.accentDesc")}
-        >
-          <div className="s-swatches" role="group">
-            {accents.map((a) => (
-              <button
-                key={a.value}
-                className={`s-swatch ${accent === a.value ? "on" : ""}`}
-                style={{ background: a.color }}
-                onClick={() => setAccent(a.value)}
-                title={a.label}
-                aria-label={a.label}
-                aria-pressed={accent === a.value}
-              />
-            ))}
-          </div>
-        </Row>
       </div>
       <div className="settings-group">
         <h3 className="settings-group-title">{t("settings.appearance.layout")}</h3>
@@ -629,34 +580,6 @@ function AppearanceSection() {
               { value: "spacious", label: t("settings.appearance.densitySpacious") },
             ]}
             onChange={setDensity}
-          />
-        </Row>
-        <Row label={t("settings.appearance.listStyle")}>
-          <Segmented
-            value={viewMode}
-            options={[
-              { value: "list", label: t("settings.appearance.listStyleList") },
-              { value: "card", label: t("settings.appearance.listStyleCard") },
-            ]}
-            onChange={setViewMode}
-          />
-        </Row>
-      </div>
-      <div className="settings-group">
-        <h3 className="settings-group-title">{t("settings.appearance.details")}</h3>
-        <Row label={t("settings.appearance.sidebarCounts")}>
-          <Toggle
-            checked={prefs.showSidebarCounts}
-            onChange={(v) => setPref({ showSidebarCounts: v })}
-          />
-        </Row>
-        <Row
-          label={t("settings.appearance.cardThumbs")}
-          desc={t("settings.appearance.cardThumbsDesc")}
-        >
-          <Toggle
-            checked={prefs.showCardThumbs}
-            onChange={(v) => setPref({ showCardThumbs: v })}
           />
         </Row>
         <Row
@@ -741,18 +664,6 @@ function ReadingSection() {
           <Toggle
             checked={prefs.showReadingTime}
             onChange={(v) => setPref({ showReadingTime: v })}
-          />
-        </Row>
-      </div>
-      <div className="settings-group">
-        <h3 className="settings-group-title">{t("settings.reading.fulltext")}</h3>
-        <Row
-          label={t("settings.reading.autoExtract")}
-          desc={t("settings.reading.autoExtractDesc")}
-        >
-          <Toggle
-            checked={prefs.autoExtract}
-            onChange={(v) => setPref({ autoExtract: v })}
           />
         </Row>
       </div>
@@ -912,28 +823,17 @@ function SyncSection({ onToast }: { onToast: (m: string) => void }) {
     queryKey: ["freshrss-status"],
     queryFn: api.freshrssStatus,
   });
-  const [provider, setProvider] = useState<api.GReaderProvider>("freshrss");
   const [url, setUrl] = useState("");
   const [user, setUser] = useState("");
   const [pass, setPass] = useState("");
   const [busy, setBusy] = useState(false);
   const connected = status.data?.connected ?? false;
-  const connectedProvider: api.GReaderProvider =
-    status.data?.provider ?? "freshrss";
-  const providerLabel = (p: api.GReaderProvider) =>
-    p === "miniflux" ? "Miniflux" : "FreshRSS";
-
-  useEffect(() => {
-    if (connected && connectedProvider === "miniflux") {
-      setProvider("miniflux");
-    }
-  }, [connected, connectedProvider]);
 
   const connect = async () => {
     if (!url.trim() || !user.trim()) return;
     setBusy(true);
     try {
-      await api.freshrssConnect(url.trim(), user.trim(), pass, provider);
+      await api.freshrssConnect(url.trim(), user.trim(), pass, "freshrss");
       await qc.invalidateQueries({ queryKey: ["freshrss-status"] });
       onToast(t("settings.sync.connected"));
       setPass("");
@@ -945,11 +845,9 @@ function SyncSection({ onToast }: { onToast: (m: string) => void }) {
   };
 
   const disconnect = async () => {
-    const previousProvider = connectedProvider;
     setBusy(true);
     try {
       await api.freshrssDisconnect();
-      setProvider(previousProvider === "miniflux" ? "miniflux" : "freshrss");
       await qc.invalidateQueries({ queryKey: ["freshrss-status"] });
       onToast(t("settings.sync.disconnected"));
     } catch (e) {
@@ -982,12 +880,6 @@ function SyncSection({ onToast }: { onToast: (m: string) => void }) {
     }
   };
 
-  const unavailable = [
-    { name: "Feedly", initial: "F", color: "#2BB24C", reason: t("settings.sync.reasonOauth") },
-    { name: "Inoreader", initial: "I", color: "#1976D2", reason: t("settings.sync.reasonOauth") },
-    { name: "iCloud", initial: "☁", color: "#0089E0", reason: t("settings.sync.reasonEntitlements") },
-  ];
-
   return (
     <>
       <div className="settings-group">
@@ -997,15 +889,12 @@ function SyncSection({ onToast }: { onToast: (m: string) => void }) {
             <div className="s-service">
               <div
                 className="logo"
-                style={{
-                  background:
-                    connectedProvider === "miniflux" ? "#1F7AEC" : "#4A4A4A",
-                }}
+                style={{ background: "#4A4A4A" }}
               >
-                {connectedProvider === "miniflux" ? "M" : "⚡"}
+                RSS
               </div>
               <div className="info">
-                <div className="title">{providerLabel(connectedProvider)}</div>
+                <div className="title">FreshRSS</div>
                 <div className="desc">{status.data?.url}</div>
               </div>
               <span className="status on">{t("settings.sync.statusConnected")}</span>
@@ -1033,18 +922,16 @@ function SyncSection({ onToast }: { onToast: (m: string) => void }) {
             >
               {t("settings.sync.syncHint")}
             </p>
-            {connectedProvider === "freshrss" && (
-              <p
-                style={{
-                  fontSize: 12,
-                  color: "var(--muted)",
-                  marginTop: 6,
-                  lineHeight: 1.5,
-                }}
-              >
-                {t("settings.sync.folderHint")}
-              </p>
-            )}
+            <p
+              style={{
+                fontSize: 12,
+                color: "var(--muted)",
+                marginTop: 6,
+                lineHeight: 1.5,
+              }}
+            >
+              {t("settings.sync.folderHint")}
+            </p>
           </>
         ) : (
           <>
@@ -1052,24 +939,6 @@ function SyncSection({ onToast }: { onToast: (m: string) => void }) {
               {t("settings.sync.connectHint")}
             </p>
             <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-              {provider === "miniflux" && (
-                <select
-                  className="modal-input"
-                  style={{ margin: 0 }}
-                  value={provider}
-                  onChange={(e) =>
-                    setProvider(e.target.value as api.GReaderProvider)
-                  }
-                  aria-label={t("settings.sync.provider")}
-                >
-                  <option value="freshrss">
-                    {t("settings.sync.providerFreshrss")}
-                  </option>
-                  <option value="miniflux">
-                    {t("settings.sync.providerMiniflux")}
-                  </option>
-                </select>
-              )}
               <input
                 className="modal-input"
                 style={{ margin: 0 }}
@@ -1088,26 +957,10 @@ function SyncSection({ onToast }: { onToast: (m: string) => void }) {
                 className="modal-input"
                 style={{ margin: 0 }}
                 type="password"
-                placeholder={
-                  provider === "miniflux"
-                    ? t("settings.sync.appPassPlaceholder")
-                    : t("settings.sync.passPlaceholder")
-                }
+                placeholder={t("settings.sync.passPlaceholder")}
                 value={pass}
                 onChange={(e) => setPass(e.target.value)}
               />
-              {provider === "miniflux" && (
-                <p
-                  style={{
-                    fontSize: 12,
-                    color: "var(--muted)",
-                    margin: "2px 0 0",
-                    lineHeight: 1.5,
-                  }}
-                >
-                  {t("settings.sync.minifluxPassHint")}
-                </p>
-              )}
               <div>
                 <button
                   className="s-btn primary"
@@ -1120,22 +973,6 @@ function SyncSection({ onToast }: { onToast: (m: string) => void }) {
             </div>
           </>
         )}
-      </div>
-
-      <div className="settings-group">
-        <h3 className="settings-group-title">{t("settings.sync.otherServices")}</h3>
-        {unavailable.map((s) => (
-          <div key={s.name} className="s-service" style={{ opacity: 0.6 }}>
-            <div className="logo" style={{ background: s.color }}>
-              {s.initial}
-            </div>
-            <div className="info">
-              <div className="title">{s.name}</div>
-              <div className="desc">{s.reason}</div>
-            </div>
-            <span className="status">{t("settings.sync.statusUnavailable")}</span>
-          </div>
-        ))}
       </div>
     </>
   );
@@ -1489,7 +1326,7 @@ function DangerZone({ onToast }: { onToast: (m: string) => void }) {
         if (
           k.startsWith("pref.") ||
           [
-            "theme", "accent", "density", "viewMode", "readerFont", "useSerif",
+            "theme", "density", "viewMode", "readerFont", "useSerif",
             "readerSize", "readerLeading", "readerWidth", "collapsedFolders",
           ].includes(k)
         ) {
@@ -1555,14 +1392,11 @@ function DangerZone({ onToast }: { onToast: (m: string) => void }) {
 
 /** Real AI provider configuration — backing the AI summary feature. */
 function AiSettingsGroup({ onToast }: { onToast: (m: string) => void }) {
-  const { t, i18n } = useTranslation();
-  const qc = useQueryClient();
+  const { t } = useTranslation();
   const [provider, setProvider] = useState<"anthropic" | "openai">("anthropic");
   const [apiKey, setApiKey] = useState("");
   const [model, setModel] = useState("");
   const [baseUrl, setBaseUrl] = useState("");
-  // Empty = not yet set; the Select then falls back to the UI language.
-  const [translateLang, setTranslateLang] = useState("");
   const savedKey = useRef("");
   const savedModel = useRef("");
   const savedBaseUrl = useRef("");
@@ -1573,9 +1407,8 @@ function AiSettingsGroup({ onToast }: { onToast: (m: string) => void }) {
       api.getSetting("ai_api_key"),
       api.getSetting("ai_model"),
       api.getSetting("ai_base_url"),
-      api.getSetting("translate_target_lang"),
     ])
-      .then(([p, k, m, b, tl]) => {
+      .then(([p, k, m, b]) => {
         if (p === "openai" || p === "anthropic") setProvider(p);
         if (k) {
           setApiKey(k);
@@ -1589,7 +1422,6 @@ function AiSettingsGroup({ onToast }: { onToast: (m: string) => void }) {
           setBaseUrl(b);
           savedBaseUrl.current = b;
         }
-        if (tl) setTranslateLang(tl);
       })
       .catch(() => {});
   }, []);
@@ -1710,23 +1542,6 @@ function AiSettingsGroup({ onToast }: { onToast: (m: string) => void }) {
               savedBaseUrl.current = trimmed;
               save("ai_base_url", trimmed, t("settings.advanced.aiBaseUrlLabel"));
             }
-          }}
-        />
-      </Row>
-      <Row
-        label={t("settings.advanced.translateLang")}
-        desc={t("settings.advanced.translateLangDesc")}
-      >
-        <Select
-          value={translateLang || i18n.language}
-          options={LANGUAGES.map((l) => ({ value: l.code, label: l.label }))}
-          onChange={(v) => {
-            setTranslateLang(v);
-            save("translate_target_lang", v, t("settings.advanced.translateLangLabel"));
-            // The reader caches this setting to decide whether a stored
-            // translation is still current — refresh it so a language change
-            // takes effect immediately.
-            qc.invalidateQueries({ queryKey: ["setting", "translate_target_lang"] });
           }}
         />
       </Row>
@@ -2075,15 +1890,6 @@ function RuleEditor({
 function AboutSection() {
   const { t } = useTranslation();
   const version = useAppVersion();
-  const [checking, setChecking] = useState(false);
-  const onCheck = async () => {
-    setChecking(true);
-    try {
-      await checkForUpdates({ silent: false });
-    } finally {
-      setChecking(false);
-    }
-  };
   return (
     <div className="s-about">
       <div className="mark">
@@ -2094,9 +1900,6 @@ function AboutSection() {
       <div className="version">
         Version{version && ` ${version}`}
       </div>
-      <button className="s-btn about-update" onClick={onCheck} disabled={checking}>
-        {checking ? t("update.checking") : t("update.checkButton")}
-      </button>
       <p className="credits">
         {t("settings.about.creditsFonts")}
         <br />

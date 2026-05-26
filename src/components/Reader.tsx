@@ -1,26 +1,29 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { LogicalPosition, LogicalSize } from "@tauri-apps/api/dpi";
+import { Webview } from "@tauri-apps/api/webview";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { openUrl } from "@tauri-apps/plugin-opener";
 import * as api from "../api";
 import { useUi } from "../store";
 import { usePlayer } from "../player";
-import { useTranslationJobs } from "../translation";
 import { useArticleActions } from "../hooks/articleActions";
 import { renderMarkdown } from "../lib/markdown";
 import { fullDate } from "../lib/feedMeta";
 import { isMac } from "../lib/platform";
+import { openInternalBrowser } from "../lib/internalBrowser";
 import { reportError, toast } from "../toast";
-import { tagColor } from "../lib/tagColors";
 import type { ArticleDetail } from "../types";
 import Icon from "./Icon";
-import TagPicker from "./TagPicker";
 import HighlightLayer from "./HighlightLayer";
 import ContextMenu, { type MenuEntry } from "./ContextMenu";
 
 interface Props {
   onToast: (msg: string) => void;
 }
+
+const READER_BROWSER_LABEL = "papr-reader-browser";
+const BROWSER_PROFILE = "browser-profile";
 
 function youtubeId(url: string | null): string | null {
   if (!url) return null;
@@ -108,10 +111,35 @@ function inPageFragment(raw: string, sourceUrl: string | null): string | null {
 
 /** Build a click handler for links inside injected HTML (article body, AI
  *  summary). In-page anchor links (footnotes, tables of contents) scroll to
- *  their target within the reader; everything else opens in the external
+ *  their target within the reader; everything else opens in the built-in
  *  browser — a bare <a> click would otherwise navigate the Tauri webview away
  *  from the app entirely (or, for a fragment link, to a bogus `app://…#frag`). */
-function makeLinkClickHandler(sourceUrl: string | null) {
+function waitForWebview(view: Webview): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const finish = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      fn();
+    };
+    view.once("tauri://created", () => finish(resolve)).catch(reject);
+    view
+      .once("tauri://error", (event) =>
+        finish(() => reject(new Error(String(event.payload)))),
+      )
+      .catch(reject);
+  });
+}
+
+function canEmbedUrl(url: string): boolean {
+  return /^https?:\/\//i.test(url);
+}
+
+function makeLinkClickHandler(
+  sourceUrl: string | null,
+  openUrl: (url: string) => void = (url) =>
+    openInternalBrowser(url).catch(reportError),
+) {
   return (e: React.MouseEvent) => {
     const link = (e.target as HTMLElement).closest("a");
     if (!link) return;
@@ -132,40 +160,29 @@ function makeLinkClickHandler(sourceUrl: string | null) {
       return;
     }
 
-    openUrl(link.href).catch(() => {});
+    openUrl(link.href);
   };
 }
 
 export default function Reader({ onToast }: Props) {
-  const { t, i18n } = useTranslation();
-  const qc = useQueryClient();
+  const { t } = useTranslation();
   const actions = useArticleActions(toast.error);
   const id = useUi((s) => s.selectedArticleId);
   const focusMode = useUi((s) => s.focusMode);
   const setFocusMode = useUi((s) => s.setFocusMode);
   const aiOpen = useUi((s) => s.aiOpen);
   const setAiOpen = useUi((s) => s.setAiOpen);
-  const markReadOnOpen = useUi((s) => s.prefs.markReadOnOpen);
-  const markReadOnScroll = useUi((s) => s.prefs.markReadOnScroll);
   const showReadingTime = useUi((s) => s.prefs.showReadingTime);
-  const autoExtract = useUi((s) => s.prefs.autoExtract);
 
   const [scrolled, setScrolled] = useState(false);
-  // Which body to show when an extraction exists follows the "auto-extract"
-  // setting: off (the default) shows the feed's own content and extraction is
-  // opt-in via the toolbar button; on shows the extracted full text.
-  const [showExtracted, setShowExtracted] = useState(autoExtract);
-  const [showTranslation, setShowTranslation] = useState(false);
-  const [tagPick, setTagPick] = useState<{ x: number; y: number } | null>(null);
   const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number } | null>(null);
   const [heroBroken, setHeroBroken] = useState(false);
   const [progress, setProgress] = useState(0);
+  const [browserUrl, setBrowserUrl] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const bodyRef = useRef<HTMLDivElement>(null);
-  // Article id we already auto-marked read via scroll, so a flurry of scroll
-  // events near the foot doesn't fire `setRead` repeatedly before the
-  // optimistic cache patch lands.
-  const scrollMarkedRef = useRef<number | null>(null);
+  const browserHostRef = useRef<HTMLDivElement>(null);
+  const browserViewRef = useRef<Webview | null>(null);
   const playTrack = usePlayer((s) => s.play);
   const playingSrc = usePlayer((s) => (s.playing ? s.track?.src : null));
 
@@ -177,26 +194,107 @@ export default function Reader({ onToast }: Props) {
   const a: ArticleDetail | undefined = article.data;
 
   const readMinutes = useMemo(() => {
-    return estimateReadMinutes(bodyPlainText(a?.extractedHtml || a?.contentHtml || ""));
-    // Recompute when the body changes — including after full-text extraction
-    // replaces the short feed snippet, which keeps the same article id.
-  }, [a?.extractedHtml, a?.contentHtml]);
+    return estimateReadMinutes(bodyPlainText(a?.contentHtml || ""));
+  }, [a?.contentHtml]);
 
-  // Reset scroll + extraction view on article change.
+  // Reset reader view on article change.
   useEffect(() => {
-    setShowExtracted(useUi.getState().prefs.autoExtract);
-    setShowTranslation(false);
+    setAiOpen(false);
+    setBrowserUrl(null);
     setScrolled(false);
-    setTagPick(null);
     setHeroBroken(false);
     setProgress(0);
-    scrollMarkedRef.current = null;
     if (scrollRef.current) scrollRef.current.scrollTop = 0;
-  }, [id]);
+  }, [id, setAiOpen]);
+
+  const openBrowserPane = useCallback((url: string) => {
+    if (!canEmbedUrl(url)) {
+      openInternalBrowser(url).catch(reportError);
+      return;
+    }
+    setAiOpen(false);
+    setScrolled(false);
+    setProgress(0);
+    setBrowserUrl(url);
+  }, [setAiOpen]);
+
+  const closeBrowserPane = useCallback(() => {
+    setBrowserUrl(null);
+  }, []);
+
+  useEffect(() => {
+    if (!browserUrl) {
+      const current = browserViewRef.current;
+      browserViewRef.current = null;
+      current?.close().catch(() => {});
+      return;
+    }
+
+    let cancelled = false;
+    let cleanupLayout = () => {};
+
+    const setBounds = async (view: Webview, host: HTMLDivElement) => {
+      const rect = host.getBoundingClientRect();
+      await view.setPosition(
+        new LogicalPosition(Math.max(0, Math.round(rect.left)), Math.max(0, Math.round(rect.top))),
+      );
+      await view.setSize(
+        new LogicalSize(Math.max(320, Math.round(rect.width)), Math.max(240, Math.round(rect.height))),
+      );
+    };
+
+    const mount = async () => {
+      const host = browserHostRef.current;
+      if (!host) return;
+
+      const existing = await Webview.getByLabel(READER_BROWSER_LABEL);
+      await existing?.close().catch(() => {});
+      if (cancelled) return;
+
+      const rect = host.getBoundingClientRect();
+      const view = new Webview(getCurrentWindow(), READER_BROWSER_LABEL, {
+        url: browserUrl,
+        x: Math.max(0, Math.round(rect.left)),
+        y: Math.max(0, Math.round(rect.top)),
+        width: Math.max(320, Math.round(rect.width)),
+        height: Math.max(240, Math.round(rect.height)),
+        focus: true,
+        dataDirectory: BROWSER_PROFILE,
+      });
+      browserViewRef.current = view;
+      await waitForWebview(view);
+      if (cancelled) {
+        await view.close().catch(() => {});
+        return;
+      }
+      await view.setFocus().catch(() => {});
+
+      const resize = () => setBounds(view, host).catch(() => {});
+      const observer = new ResizeObserver(resize);
+      observer.observe(host);
+      window.addEventListener("resize", resize);
+      cleanupLayout = () => {
+        observer.disconnect();
+        window.removeEventListener("resize", resize);
+      };
+      resize();
+    };
+
+    mount().catch(reportError);
+
+    return () => {
+      cancelled = true;
+      cleanupLayout();
+      const current = browserViewRef.current;
+      if (current?.label === READER_BROWSER_LABEL) {
+        browserViewRef.current = null;
+        current.close().catch(() => {});
+      }
+    };
+  }, [browserUrl]);
 
   // Hide article-body images that fail to load — a broken-image icon in the
-  // middle of an article is just noise. Runs whenever the body changes
-  // (article switch, extract toggle, extraction finishing).
+  // middle of an article is just noise. Runs whenever the body changes.
   useEffect(() => {
     const el = bodyRef.current;
     if (!el) return;
@@ -213,99 +311,7 @@ export default function Reader({ onToast }: Props) {
       }
     });
     return () => watched.forEach((img) => img.removeEventListener("error", hide));
-  }, [a?.id, showExtracted, a?.extractedHtml, showTranslation, a?.translatedHtml]);
-
-  // Mark as read once when an unread article is opened (if the user opted in).
-  useEffect(() => {
-    if (a && !a.isRead && markReadOnOpen) actions.setRead(a.id, true);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [a?.id]);
-
-  // The extracted article id travels as the mutation variable, not via the
-  // `a` closure: extraction is async and the user can switch articles before
-  // it resolves. Keying onSuccess off the live `a` would invalidate the wrong
-  // article (the extracted text never shows on return) and toast "full text
-  // extracted" while reading an unrelated, un-extracted article.
-  const extract = useMutation({
-    mutationFn: (articleId: number) => api.extractFulltext(articleId),
-    onSuccess: (_data, articleId) => {
-      qc.invalidateQueries({ queryKey: ["article", articleId] });
-      // Only the article still on screen should flip into the extracted view
-      // and surface the toast.
-      if (useUi.getState().selectedArticleId === articleId) {
-        setShowExtracted(true);
-        onToast(t("reader.fullTextExtracted"));
-      }
-    },
-    onError: (e) => reportError(e),
-  });
-
-  // The configured translation target, falling back to the UI language. The
-  // article's cached `translatedLang` (and any running job's `lang`) is compared
-  // against this to decide whether a translation is current for it.
-  const translateSetting = useQuery({
-    queryKey: ["setting", "translate_target_lang"],
-    queryFn: () => api.getSetting("translate_target_lang"),
-  });
-  const targetLang = translateSetting.data || i18n.language;
-
-  // Background translation jobs run independently of this view, so several
-  // articles can translate at once and switching away never interrupts one.
-  const startTranslate = useTranslationJobs((s) => s.translate);
-  const job = useTranslationJobs((s) => (id != null ? s.jobs[id] : undefined));
-
-  // When a translation finishes, refetch the article so its persisted
-  // `translatedHtml` lands in the cache — the toggle then keeps working after
-  // the in-memory job is gone (e.g. reopening the article in a later session).
-  useEffect(() => {
-    if (id == null || !job) return;
-    if (job.status === "done") {
-      qc.invalidateQueries({ queryKey: ["article", id] });
-    } else if (job.status === "error") {
-      // The translation failed (a toast already surfaced why) — drop back to the
-      // original so the view isn't stuck on an empty "translating…" state.
-      setShowTranslation(false);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [id, job?.status]);
-
-  // With "auto-extract full text" on, a summary-only feed item is upgraded to
-  // the full page the moment it's opened, so the reader never shows a two-line
-  // stub. Skipped when the feed already carries the whole article, when there
-  // is no source URL to fetch, or once attempted for this article — so a
-  // failed fetch isn't retried on every re-render.
-  const autoExtractedRef = useRef<number | null>(null);
-  useEffect(() => {
-    if (!autoExtract || !a || !a.url || a.extractedHtml) return;
-    if (autoExtractedRef.current === a.id || extract.isPending) return;
-    // Measure the *decoded* text, not the raw markup. A bare `<[^>]+>` tag
-    // strip leaves HTML entities intact, so an entity-heavy stub
-    // (`&nbsp;`-padded copy, `&mdash;`/`&amp;` runs) is over-counted — a
-    // genuinely short snippet can clear the 800-char bar and wrongly look
-    // "complete", leaving the reader showing the very stub auto-extract is
-    // meant to replace. `bodyPlainText` decodes entities and drops markup
-    // cleanly, the same measurement the reading-time estimate already uses.
-    const plain = bodyPlainText(a.contentHtml || "").trim();
-    if (plain.length >= 800) return; // feed already delivers the full text
-    autoExtractedRef.current = a.id;
-    extract.mutate(a.id);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [a?.id, a?.extractedHtml, autoExtract]);
-
-  // Mark the current article read once its foot is reached. Also fires for an
-  // article short enough to need no scrolling at all (`scrollHeight` already
-  // within `clientHeight`) — that case produces no `scroll` event, so without
-  // a render-time check a fully-visible short article would never be marked
-  // read despite "mark read on scroll" being on.
-  const markReadIfAtFoot = useCallback(() => {
-    const el = scrollRef.current;
-    if (!el || !markReadOnScroll || !a || a.isRead) return;
-    if (scrollMarkedRef.current === a.id) return;
-    if (el.scrollHeight - el.scrollTop - el.clientHeight < 120) {
-      scrollMarkedRef.current = a.id;
-      actions.setRead(a.id, true);
-    }
-  }, [markReadOnScroll, a, actions]);
+  }, [a?.id, a?.contentHtml]);
 
   const onScroll = () => {
     const el = scrollRef.current;
@@ -313,38 +319,13 @@ export default function Reader({ onToast }: Props) {
     setScrolled(el.scrollTop > 8);
     const max = el.scrollHeight - el.clientHeight;
     setProgress(max > 0 ? Math.min(1, el.scrollTop / max) : 0);
-    markReadIfAtFoot();
   };
-
-  // A short article that fits the viewport never fires `scroll`, so check the
-  // foot condition once the body has laid out (article switch, extract toggle,
-  // extraction finishing). The check is deferred briefly so body images have a
-  // chance to load — measuring `scrollHeight` before they do could read a
-  // too-small height and mark a genuinely long article read prematurely. The
-  // `scrollMarkedRef` guard keeps it idempotent.
-  useEffect(() => {
-    const timer = window.setTimeout(markReadIfAtFoot, 400);
-    return () => window.clearTimeout(timer);
-  }, [markReadIfAtFoot, showExtracted, a?.extractedHtml, a?.contentHtml]);
 
 
   const copyLink = () => {
     if (!a?.url) return;
     navigator.clipboard.writeText(a.url).then(() => onToast(t("reader.linkCopied")), () => {});
   };
-  const share = () => {
-    if (!a?.url) return;
-    if (navigator.share) {
-      navigator.share({ title: a.title, url: a.url }).catch((e) => {
-        // A user-cancelled share rejects with AbortError — only fall back to
-        // copying the link on a genuine failure (e.g. share unsupported).
-        if ((e as Error)?.name !== "AbortError") copyLink();
-      });
-    } else {
-      copyLink();
-    }
-  };
-
   if (id == null) {
     const kbd = {
       fontFamily: "var(--mono)",
@@ -418,38 +399,7 @@ export default function Reader({ onToast }: Props) {
     );
   }
 
-  const hasExtracted = !!a.extractedHtml;
-  const canTranslate = !!(a.extractedHtml || a.contentHtml);
-  const baseBody =
-    (showExtracted && a.extractedHtml ? a.extractedHtml : a.contentHtml) || "";
-
-  // A translation is "current" for this article only when it was produced for
-  // the active target language — a stale-language copy (cache or a job for a
-  // previously chosen language) is ignored so a re-translate kicks in instead.
-  const jobForTarget = job && job.lang === targetLang ? job : undefined;
-  const translating = jobForTarget?.status === "translating";
-  const cachedValid = !!a.translatedHtml && a.translatedLang === targetLang;
-  // Prefer the live job (grows per batch) so the translation streams in; fall
-  // back to the persisted copy when the article is reopened in a later session.
-  const translatedBody =
-    jobForTarget?.html || (cachedValid ? a.translatedHtml ?? "" : "");
-  const hasTranslation = !!translatedBody;
-  // The inline original/translation toggle appears once there is something to
-  // show or a translation is being produced.
-  const showToggle = hasTranslation || translating;
-  // In the translated view: show the translation when we have any, the
-  // "translating…" placeholder while a batch is still pending, and otherwise
-  // (e.g. the job errored) fall back to the original rather than a stuck spinner.
-  const body = showTranslation
-    ? translatedBody ||
-      (translating ? `<p><em>${t("reader.translating")}</em></p>` : baseBody)
-    : baseBody;
-
-  const beginTranslate = () => {
-    if (!canTranslate) return;
-    if (!hasTranslation && !translating) startTranslate(a.id, targetLang);
-    setShowTranslation(true);
-  };
+  const body = a.contentHtml || "";
 
   const ytId = a.sourceType === "youtube" ? youtubeId(a.url) : null;
 
@@ -460,61 +410,41 @@ export default function Reader({ onToast }: Props) {
         {...(isMac && { "data-tauri-drag-region": true })}
       >
         <button
-          className={`tb-btn ${a.isStarred ? "on" : ""}`}
-          onClick={() => actions.setStarred(a.id, !a.isStarred)}
-          title={t("reader.tbStar")}
-          aria-label={t("reader.tbStar")}
-          aria-pressed={a.isStarred}
-        >
-          <Icon name={a.isStarred ? "star-fill" : "star"} size={16} />
-        </button>
-        <button
-          className={`tb-btn ${a.readLater ? "on" : ""}`}
-          onClick={() => actions.setReadLater(a.id, !a.readLater)}
-          title={t("reader.tbReadLater")}
-          aria-label={t("reader.tbReadLater")}
-          aria-pressed={a.readLater}
-        >
-          <Icon name={a.readLater ? "bookmark-fill" : "bookmark"} size={16} />
-        </button>
-        <button
-          className={`tb-btn ${a.tags.length > 0 ? "on" : ""}`}
-          onClick={(e) => {
-            const r = e.currentTarget.getBoundingClientRect();
-            setTagPick((p) => (p ? null : { x: r.left, y: r.bottom + 6 }));
-          }}
-          title={t("reader.tbTags")}
-          aria-label={t("reader.tbTags")}
-          aria-haspopup="menu"
-          aria-expanded={tagPick != null}
-        >
-          <Icon name="tag" size={16} />
-        </button>
-        <button
-          className={`tb-btn ${hasExtracted && showExtracted ? "on" : ""} ${
-            extract.isPending ? "spinning" : ""
-          }`}
-          onClick={() =>
-            hasExtracted ? setShowExtracted((v) => !v) : extract.mutate(a.id)
+          className="tb-btn"
+          onClick={() => actions.setRead(a.id, !a.isRead)}
+          title={
+            a.isRead
+              ? t("articleList.menuMarkUnread")
+              : t("articleList.menuMarkRead")
           }
-          // Extraction needs the source URL; without one (and nothing
-          // extracted yet) the button can only error, so disable it.
-          disabled={extract.isPending || (!hasExtracted && !a.url)}
-          title={hasExtracted ? t("reader.tbToggleFullText") : t("reader.tbExtractFullText")}
-          aria-label={hasExtracted ? t("reader.tbToggleFullText") : t("reader.tbExtractFullText")}
-          aria-pressed={hasExtracted ? showExtracted : undefined}
-          aria-busy={extract.isPending}
+          aria-label={
+            a.isRead
+              ? t("articleList.menuMarkUnread")
+              : t("articleList.menuMarkRead")
+          }
         >
-          <Icon name="text" size={16} />
+          <Icon name={a.isRead ? "circle" : "check"} size={16} />
+        </button>
+        <button
+          className={`tb-btn ${aiOpen ? "on" : ""}`}
+          onClick={() => {
+            if (browserUrl) closeBrowserPane();
+            setAiOpen(!aiOpen);
+          }}
+          title={t("reader.tbAiSummary")}
+          aria-label={t("reader.tbAiSummary")}
+          aria-pressed={aiOpen}
+        >
+          <Icon name={aiOpen ? "sparkle-fill" : "sparkle"} size={16} />
         </button>
         <button
           className="tb-btn"
-          title={t("reader.tbShare")}
-          aria-label={t("reader.tbShare")}
-          onClick={share}
+          title={t("reader.tbOpenInBrowser")}
+          aria-label={t("reader.tbOpenInBrowser")}
+          onClick={() => a.url && openBrowserPane(a.url)}
           disabled={!a.url}
         >
-          <Icon name="share" size={16} />
+          <Icon name="open" size={16} />
         </button>
         <HighlightLayer
           // Keyed by article id so the export menu / popovers reset cleanly
@@ -525,16 +455,6 @@ export default function Reader({ onToast }: Props) {
           bodyVersion={body}
         />
         <div className="tb-btn spacer" />
-        {a.url && (
-          <button
-            className="tb-btn"
-            title={t("reader.tbOpenInBrowser")}
-            aria-label={t("reader.tbOpenInBrowser")}
-            onClick={() => openUrl(a.url!).catch(() => {})}
-          >
-            <Icon name="open" size={16} />
-          </button>
-        )}
       </div>
 
       <div className="read-progress-track" aria-hidden="true">
@@ -544,16 +464,35 @@ export default function Reader({ onToast }: Props) {
         />
       </div>
 
-      <div
-        className="reader-scroll"
-        ref={scrollRef}
-        onScroll={onScroll}
-        onContextMenu={(e) => {
-          e.preventDefault();
-          setCtxMenu({ x: e.clientX, y: e.clientY });
-        }}
-      >
-        <article className="article reader-content" key={a.id}>
+      {browserUrl ? (
+        <div className="reader-browser">
+          <div className="reader-browser-bar">
+            <button
+              className="reader-browser-back"
+              onClick={closeBrowserPane}
+              title={t("reader.backToArticle")}
+              aria-label={t("reader.backToArticle")}
+            >
+              <Icon name="chevron-right" size={14} className="back-icon" />
+              <span>{t("reader.backToArticle")}</span>
+            </button>
+            <span className="reader-browser-url" title={browserUrl}>
+              {browserUrl}
+            </span>
+          </div>
+          <div className="reader-browser-host" ref={browserHostRef} />
+        </div>
+      ) : (
+        <div
+          className="reader-scroll"
+          ref={scrollRef}
+          onScroll={onScroll}
+          onContextMenu={(e) => {
+            e.preventDefault();
+            setCtxMenu({ x: e.clientX, y: e.clientY });
+          }}
+        >
+          <article className="article reader-content" key={a.id}>
           <span className="article-feed">
             <Icon name="rss" size={13} />
             {a.feedTitle}
@@ -569,31 +508,7 @@ export default function Reader({ onToast }: Props) {
                 <span>{t("reader.readMinutes", { count: readMinutes })}</span>
               </>
             )}
-            {extract.isPending && (
-              <>
-                <span>·</span>
-                <span>{t("reader.extractingFullText")}</span>
-              </>
-            )}
           </div>
-
-          {a.tags.length > 0 && (
-            <div className="article-tags">
-              {a.tags.map((tag) => (
-                <button
-                  key={tag.id}
-                  className="article-tag"
-                  style={{ "--tag-c": tagColor(tag.color) } as React.CSSProperties}
-                  onClick={() =>
-                    useUi.getState().select({ kind: "tag", value: tag.id }, tag.name)
-                  }
-                >
-                  <span className="tag-dot" />
-                  {tag.name}
-                </button>
-              ))}
-            </div>
-          )}
 
           {ytId ? (
             <iframe
@@ -612,6 +527,7 @@ export default function Reader({ onToast }: Props) {
             // feeds that repeat their lead image don't show it twice.
             !body.includes(a.imageUrl) && (
               <img
+                className="article-hero"
                 src={a.imageUrl}
                 alt=""
                 onError={() => setHeroBroken(true)}
@@ -655,42 +571,17 @@ export default function Reader({ onToast }: Props) {
               </div>
             ))}
 
-          {showToggle && (
-            <div className="tr-toggle" role="group" aria-label={t("reader.tbTranslate")}>
-              <button
-                className={!showTranslation ? "on" : ""}
-                aria-pressed={!showTranslation}
-                onClick={() => setShowTranslation(false)}
-              >
-                {t("reader.original")}
-              </button>
-              <button
-                className={showTranslation ? "on" : ""}
-                aria-pressed={showTranslation}
-                onClick={() => setShowTranslation(true)}
-              >
-                {t("reader.translation")}
-              </button>
-              {translating && (
-                <span className="tr-progress">
-                  {t("reader.translating")}
-                  {jobForTarget && jobForTarget.total > 0 &&
-                    ` ${jobForTarget.done}/${jobForTarget.total}`}
-                </span>
-              )}
-            </div>
-          )}
-
           <div
             className="article-body"
             ref={bodyRef}
-            onClick={makeLinkClickHandler(a.url)}
+            onClick={makeLinkClickHandler(a.url, openBrowserPane)}
             dangerouslySetInnerHTML={{
               __html: body || `<p><em>${t("reader.noContent")}</em></p>`,
             }}
           />
-        </article>
-      </div>
+          </article>
+        </div>
+      )}
 
       <AIDrawer
         // Keyed by article id so switching articles remounts the drawer:
@@ -702,16 +593,6 @@ export default function Reader({ onToast }: Props) {
         onClose={() => setAiOpen(false)}
       />
 
-      {tagPick && (
-        <TagPicker
-          articleId={a.id}
-          attached={a.tags.map((tg) => tg.id)}
-          x={tagPick.x}
-          y={tagPick.y}
-          onClose={() => setTagPick(null)}
-        />
-      )}
-
       {ctxMenu && (
         <ContextMenu
           x={ctxMenu.x}
@@ -722,15 +603,12 @@ export default function Reader({ onToast }: Props) {
               label: t("reader.tbAiSummary"),
               onClick: () => setAiOpen(!aiOpen),
             },
-            ...(canTranslate
+            ...(a.url
               ? [
                   {
-                    icon: "globe",
-                    label: showTranslation
-                      ? t("reader.tbShowOriginal")
-                      : t("reader.tbTranslate"),
-                    onClick: () =>
-                      showTranslation ? setShowTranslation(false) : beginTranslate(),
+                    icon: "open",
+                    label: t("reader.tbOpenInBrowser"),
+                    onClick: () => openBrowserPane(a.url!),
                   },
                 ]
               : []),
@@ -861,6 +739,15 @@ function AIDrawer({
           <Icon name="sparkle-fill" size={15} />
         </span>
         <h3>{t("reader.aiSummaryTitle")}</h3>
+        <button
+          className={`tb-btn ${busy ? "spinning" : ""}`}
+          onClick={onRetry}
+          disabled={busy}
+          title={t("reader.aiRegenerate")}
+          aria-label={t("reader.aiRegenerate")}
+        >
+          <Icon name="refresh" size={14} />
+        </button>
         <button
           className="tb-btn close"
           onClick={onClose}

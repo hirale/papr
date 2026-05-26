@@ -1,5 +1,4 @@
-//! Feed refresh: a reusable `refresh_all` (driven by both the manual command
-//! and the periodic timer) plus the background scheduler loop.
+//! Feed refresh helpers plus the background FreshRSS sync loop.
 
 use crate::db;
 use crate::error::AppResult;
@@ -391,8 +390,14 @@ pub fn spawn_scheduler(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(Duration::from_secs(8)).await;
         loop {
-            if let Err(e) = refresh_all(&app, None, false).await {
-                log::warn!("scheduled refresh failed: {e}");
+            match sync::run_if_connected(&app).await {
+                Ok(true) => {
+                    let _ = app.emit("feeds-updated", 0);
+                    notify::update_badge(&app).await;
+                    tray::refresh(&app).await;
+                }
+                Ok(false) => {}
+                Err(e) => log::warn!("scheduled FreshRSS sync failed: {e}"),
             }
             // Wait for the configured interval, but in short slices so a
             // changed interval is picked up promptly instead of only after

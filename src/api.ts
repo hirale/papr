@@ -87,10 +87,6 @@ export const markAllRead = (query: ArticleQuery) =>
   invoke<number>("mark_all_read", { query });
 export const smartCounts = () => invoke<SmartCounts>("smart_counts");
 
-// ── full-text extraction ──
-export const extractFulltext = (articleId: number) =>
-  invoke<string>("extract_fulltext", { articleId });
-
 // ── OPML ──
 export const importOpml = (content: string) =>
   invoke<number>("import_opml", { content });

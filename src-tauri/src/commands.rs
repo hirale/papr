@@ -4,7 +4,6 @@
 use crate::ai::{self, AiConfig, AiEvent};
 use crate::db::{self};
 use crate::error::{AppError, AppResult};
-use crate::extraction;
 use crate::ingestion::discovery::{self, DiscoveryResult};
 use crate::ingestion::newsletter::{self, NewsletterConfig};
 use crate::ingestion::sources::{self, Normalized};
@@ -261,13 +260,21 @@ pub async fn rename_feed(state: State<'_, AppState>, id: i64, title: String) -> 
     db::rename_feed(&conn, id, &title)
 }
 
-/// Refresh every feed, streaming progress to the frontend over `on_progress`.
+/// Legacy refresh entry point. This fork is FreshRSS-only, so a refresh means
+/// sync the GReader backend rather than fetching local feed URLs.
 #[tauri::command]
 pub async fn refresh_feeds(
     app: AppHandle,
     on_progress: Channel<RefreshProgress>,
 ) -> AppResult<usize> {
-    scheduler::refresh_all(&app, Some(on_progress), false).await
+    let _ = on_progress.send(RefreshProgress::Started { total: 0 });
+    let stats = crate::sync::sync_now(&app).await?;
+    let _ = on_progress.send(RefreshProgress::Finished {
+        new_articles: stats.imported_articles,
+    });
+    let _ = app.emit("feeds-updated", 0);
+    refresh_unread_surfaces(&app).await;
+    Ok(stats.imported_articles)
 }
 
 // ─────────────────────────── articles ───────────────────────────
@@ -391,36 +398,6 @@ pub async fn smart_counts(state: State<'_, AppState>) -> AppResult<SmartCounts> 
         starred,
         read_later,
     })
-}
-
-// ─────────────────────────── full-text extraction ───────────────────────────
-
-/// Fetch the article's source page and extract its full text (Readability).
-/// Stores the result so subsequent reads are instant/offline.
-#[tauri::command]
-pub async fn extract_fulltext(state: State<'_, AppState>, article_id: i64) -> AppResult<String> {
-    let url = {
-        let conn = state.read().await;
-        db::get_article(&conn, article_id)?
-            .url
-            .ok_or_else(|| AppError::code("noArticleUrl"))?
-    };
-
-    let http = state.http();
-    let (bytes, ct, final_url) = fetch::get(&http, &url).await?;
-    // Decode in the page's declared charset — a non-UTF-8 page (Shift-JIS,
-    // GBK, ISO-8859-1, …) would otherwise become mojibake before Readability.
-    let html = fetch::decode_html(&bytes, ct.as_deref());
-
-    // Readability is not Send — run it on the blocking pool.
-    let extracted =
-        tokio::task::spawn_blocking(move || extraction::extract_article(&html, &final_url))
-            .await
-            .map_err(|e| AppError::other(format!("extraction task: {e}")))??;
-
-    let conn = state.db.lock().await;
-    db::set_extracted_html(&conn, article_id, &extracted)?;
-    Ok(extracted)
 }
 
 // ─────────────────────────── OPML ───────────────────────────
@@ -562,19 +539,23 @@ pub async fn ai_summarize(
     if body.trim().is_empty() {
         return Err(AppError::code("noArticleBody"));
     }
-    // The drawer renders the response as markdown (.ai-prose styles paragraphs,
-    // bullets, and bold), so we ask for structured output instead of a single
-    // dense paragraph — the reader can scan a TL;DR + bullets far faster.
+    // The drawer renders markdown, so keep the shape predictable and useful for
+    // triage: what happened, why it matters, and whether opening the source is
+    // worth the user's time. The model must stay inside the article text.
     let system = format!(
-        "You are a sharp news editor. Summarize the article so a reader can \
-         decide whether to read it in full.\n\n\
-         Format the response in markdown using exactly this shape:\n\
-         **TL;DR** — One sentence capturing the single most important point.\n\n\
-         - Key fact, finding, or claim (under ~20 words)\n\
-         - Another key point\n\
-         - 3 to 5 bullets total, one idea each, no nested bullets\n\n\
-         Output only this structure. No preamble, no closing remarks, no \
-         section headers, no extra prose.{lang}"
+        "You are a pragmatic RSS reading assistant. Summarize only what is in \
+         the article; do not invent background facts, numbers, causes, or \
+         implications. If the article is thin, say so briefly.\n\n\
+         Use the response language for all labels and content. Write markdown \
+         in exactly this structure:\n\
+         **One sentence**: one concise sentence with the main point.\n\n\
+         **Key points**\n\
+         - 3 to 5 bullets, one concrete point per bullet\n\
+         - Keep each bullet under 24 words\n\
+         - Preserve important names, dates, numbers, and caveats\n\n\
+         **Open original?**: Yes/No/Maybe, or the local-language equivalent, \
+         with one short reason.\n\n\
+         No preamble, no closing remarks, no nested bullets.{lang}"
     );
     let user = format!("Title: {title}\n\n{}", truncate(&body, 8000));
 

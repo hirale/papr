@@ -1,0 +1,13 @@
+.git
+.claude
+.cache
+.pnpm-store
+artifacts
+dist
+dist-ssr
+logs
+node_modules
+src-tauri/target
+*.log
+*.local
+.DS_Store
